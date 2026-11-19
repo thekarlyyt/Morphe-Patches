@@ -1236,8 +1236,17 @@ public final class TkProtect {
     }
 
     private static String textOf(Object value) {
+        // Some Innertube responses contain non-finite numbers or the literal "NaN"; they must
+        // never reach the panel as visible text.
+        if (value instanceof Number) {
+            double number = ((Number) value).doubleValue();
+            if (Double.isNaN(number) || Double.isInfinite(number)) {
+                return "";
+            }
+        }
         if (value instanceof String || value instanceof Number) {
-            return String.valueOf(value);
+            String text = String.valueOf(value);
+            return ("NaN".equals(text) || "undefined".equals(text)) ? "" : text;
         }
         if (value instanceof JSONObject) {
             JSONObject object = (JSONObject) value;
@@ -1411,7 +1420,7 @@ public final class TkProtect {
             }
             String id = properties.optString("commentId", "");
             JSONObject content = properties.optJSONObject("content");
-            String text = content == null ? "" : content.optString("content", "");
+            String text = content == null ? "" : textOf(content.opt("content"));
             if (text.isEmpty() && id.isEmpty()) {
                 continue;
             }
@@ -2462,7 +2471,7 @@ public final class TkProtect {
                 "let tab='chat',videoId='',chat=[],comments=[],ready=false,resetChat=true,resetComments=true,streamerAction='auto_delete',userMode='viewer',streamerLinked=false;",
                 "const $=id=>document.getElementById(id);",
                 "function log(m){const l=$('log');l.innerHTML='<div>'+new Date().toLocaleTimeString()+' — '+m+'</div>'+l.innerHTML}",
-                "function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')",
+                "function esc(s){if(s==null||s==='NaN'||s==='undefined'||(typeof s==='number'&&!isFinite(s)))s='';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;')",
                 ".replace(/>/g,'&gt;').replace(/\"/g,'&quot;')}",
                 "function escJs(s){return String(s==null?'':s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,\"\\\\'\")}",
                 "function mod(id,ch){log('Модерация: '+id);TK.moderate(id,ch||'')}",
@@ -2472,7 +2481,7 @@ public final class TkProtect {
                 "const btn=canMod?'<div><button onclick=\"mod(\\''+escJs(x.id)+'\\',\\''+escJs(x.channelId||'')+'\\')\">Удалить'+(x.channelId?' / применить бан':'')+'</button></div>':'';",
                 "return '<div class=\"item'+(off?' hidden':'')+'\"><div class=meta><b>'+esc(x.author||'Аноним')+'</b>',",
                 "+(x.publishedAt?'<span>'+esc(x.publishedAt)+'</span>':'')+'</div><div class=text'+(off?' masked':'')+'>'",
-                "+(off?'Скрыто TKProtect':esc(x.text))+'</div>'+(x.verdict&&!off&&x.verdict.bad?",
+                "+(off?'Скрыто TKProtect':esc(x.text))+'</div>'+(x.verdict&&x.verdict.bad?",
                 "'<div class=bad>'+esc(x.verdict.label+extra)+'</div>':(extra?'<div class=bad>'+esc(extra.replace(/^ · /,''))+'</div>':''))+btn+'</div>'}).join('')}",
                 "function refresh(){render(chat,$('chat'),$('force').checked);",
                 "render(comments,$('comments'),$('force').checked);",

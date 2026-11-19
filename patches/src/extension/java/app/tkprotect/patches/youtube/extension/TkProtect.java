@@ -80,6 +80,11 @@ public final class TkProtect {
     private static final String KEY_GOOGLE_TOKEN_EXPIRY = "google_token_expiry";
     private static final String KEY_STREAMER_LIVE_CHAT_ID = "streamer_live_chat_id";
     private static final String KEY_STREAMER_VIDEO_ID = "streamer_video_id";
+    private static final String KEY_STREAMER_ACTION = "streamer_action"; // auto_delete | manual
+    private static final String KEY_STREAMER_BAN_MODE = "streamer_ban_mode"; // off | timeout | permanent
+    private static final String KEY_STREAMER_BAN_SECONDS = "streamer_ban_seconds";
+    private static final String KEY_STREAMER_MANUAL_BIND = "streamer_manual_bind"; // 0 | 1
+    private static final String KEY_STREAMER_MANUAL_LIVE_CHAT_ID = "streamer_manual_live_chat_id";
 
     private static final String DEF_TK_BASE =
             "https://thekarly.su/wp-content/plugins/tkcore/easyapi.php";
@@ -451,6 +456,27 @@ public final class TkProtect {
             });
             streamerBox.addView(findStreamButton);
             streamerBox.addView(streamStatus);
+
+            final Spinner streamerActionInput = labeledSpinner(activity, streamerBox, "Действие при нарушении",
+                    new String[]{"Авто-удалять (рекомендуется)", "Только помечать (ручное подтверждение)"},
+                    "manual".equals(pref(activity, KEY_STREAMER_ACTION, "auto_delete")) ? 1 : 0);
+            final Spinner streamerBanInput = labeledSpinner(activity, streamerBox, "Бан/таймаут нарушителей",
+                    new String[]{"Выкл (по умолчанию)", "Таймаут", "Бан навсегда"},
+                    banModeIndex(pref(activity, KEY_STREAMER_BAN_MODE, "off")));
+            final EditText streamerBanSecondsInput = field(activity, streamerBox,
+                    "Длительность таймаута (сек)", pref(activity, KEY_STREAMER_BAN_SECONDS, "300"));
+
+            final Spinner manualBindInput = labeledSpinner(activity, streamerBox, "Привязка стрима",
+                    new String[]{"Авто-поиск активного стрима", "Вручную (liveChatId)"},
+                    "1".equals(pref(activity, KEY_STREAMER_MANUAL_BIND, "0")) ? 1 : 0);
+            final EditText manualLiveChatIdInput = field(activity, streamerBox,
+                    "liveChatId (вручную)", pref(activity, KEY_STREAMER_MANUAL_LIVE_CHAT_ID, ""));
+            TextView manualBindNote = new TextView(activity);
+            manualBindNote.setText("Ручная привязка по умолчанию выключена. Используйте, если авто-поиск не находит стрим. "
+                    + "Нужен liveChatId активного эфира (можно получить из API/инструментов стримера).");
+            manualBindNote.setPadding(0, dp(activity, 4), 0, 0);
+            streamerBox.addView(manualBindNote);
+
             box.addView(streamerBox);
 
             final EditText innertubeInput =
@@ -490,6 +516,12 @@ public final class TkProtect {
                         savePref(activity, KEY_VERSION, selectedVersion(versionInput));
                         savePref(activity, KEY_GOOGLE_CLIENT_ID, googleClientIdInput.getText().toString().trim());
                         savePref(activity, KEY_GOOGLE_CLIENT_SECRET, googleClientSecretInput.getText().toString().trim());
+                        savePref(activity, KEY_STREAMER_ACTION, streamerActionInput.getSelectedItemPosition() == 1 ? "manual" : "auto_delete");
+                        savePref(activity, KEY_STREAMER_BAN_MODE, banModeValue(streamerBanInput.getSelectedItemPosition()));
+                        savePref(activity, KEY_STREAMER_BAN_SECONDS, streamerBanSecondsInput.getText().toString().trim().isEmpty()
+                                ? "300" : streamerBanSecondsInput.getText().toString().trim());
+                        savePref(activity, KEY_STREAMER_MANUAL_BIND, manualBindInput.getSelectedItemPosition() == 1 ? "1" : "0");
+                        savePref(activity, KEY_STREAMER_MANUAL_LIVE_CHAT_ID, manualLiveChatIdInput.getText().toString().trim());
                         savePref(activity, KEY_INNERTUBE_KEY, innertubeInput.getText().toString().trim());
                         savePref(activity, KEY_CLIENT_VERSION, clientInput.getText().toString().trim());
                         workingVersion = "";
@@ -572,13 +604,43 @@ public final class TkProtect {
             statusView.setTextColor(0xFFFF6B6B);
             return;
         }
-        String chatId = pref(context, KEY_STREAMER_LIVE_CHAT_ID, "");
+        String chatId = effectiveLiveChatId(context);
         String base = "Google: авторизован";
         if (!chatId.isEmpty()) {
             base += " · liveChatId привязан";
         }
         statusView.setText(base);
         statusView.setTextColor(0xFF7BD88F);
+    }
+
+    private static Spinner labeledSpinner(Context context, LinearLayout parent, String label,
+                                          String[] labels, int selectedIndex) {
+        TextView text = new TextView(context);
+        text.setText(label);
+        text.setPadding(0, dp(context, 10), 0, 0);
+        parent.addView(text);
+        Spinner spinner = new Spinner(context);
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(context,
+                android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+        if (selectedIndex < 0) selectedIndex = 0;
+        if (selectedIndex >= labels.length) selectedIndex = labels.length - 1;
+        spinner.setSelection(selectedIndex);
+        parent.addView(spinner);
+        return spinner;
+    }
+
+    private static int banModeIndex(String value) {
+        if ("timeout".equals(value)) return 1;
+        if ("permanent".equals(value)) return 2;
+        return 0;
+    }
+
+    private static String banModeValue(int index) {
+        if (index == 1) return "timeout";
+        if (index == 2) return "permanent";
+        return "off";
     }
 
     // ---------------------------------------------------------------------------------------
@@ -600,17 +662,23 @@ public final class TkProtect {
                 @Override
                 public JSONObject execute(JSONObject args) throws Exception {
                     JSONObject out = new JSONObject();
-                    String key = pref(context, KEY_API_KEY, "");
-                    out.put("ready", !key.isEmpty());
-                    out.put("keyMask", maskKey(key));
-                    out.put("keyLen", key.length());
-                    out.put("apiVersion", activeVersion(context));
-                    out.put("userMode", pref(context, KEY_USER_MODE, DEF_USER_MODE));
-                    out.put("streamerLinked", hasGoogleTokens(context));
-                    out.put("liveChatId", pref(context, KEY_STREAMER_LIVE_CHAT_ID, ""));
+                    putStatus(out);
                     return out;
                 }
             });
+        }
+
+        private void putStatus(JSONObject out) throws Exception {
+            String key = pref(context, KEY_API_KEY, "");
+            out.put("ready", !key.isEmpty());
+            out.put("keyMask", maskKey(key));
+            out.put("keyLen", key.length());
+            out.put("apiVersion", activeVersion(context));
+            out.put("userMode", pref(context, KEY_USER_MODE, DEF_USER_MODE));
+            out.put("streamerLinked", hasGoogleTokens(context));
+            out.put("liveChatId", effectiveLiveChatId(context));
+            out.put("streamerAction", pref(context, KEY_STREAMER_ACTION, "auto_delete"));
+            out.put("banMode", streamerBanMode(context));
         }
 
         /** Returns the video that is currently playing, so the panel can bind automatically. */
@@ -667,14 +735,14 @@ public final class TkProtect {
                         Verdict verdict = verdictForText(context, text);
                         item.put("verdict", verdictJson(verdict));
                         item.put("hidden", verdict.bad);
-                        maybeAutoDeleteChatMessage(context, item, verdict);
+                        maybeAutoModerateChatMessage(context, item, verdict);
                         outMessages.put(item);
                     }
                     JSONObject out = new JSONObject();
                     out.put("video", videoInfo(context, videoId));
                     out.put("messages", outMessages);
                     out.put("error", page.optString("error", ""));
-                    out.put("ready", !pref(context, KEY_API_KEY, "").isEmpty());
+                    putStatus(out);
                     return out;
                 }
             });
@@ -716,8 +784,20 @@ public final class TkProtect {
                     out.put("video", videoInfo(context, videoId));
                     out.put("comments", outComments);
                     out.put("error", page.optString("error", ""));
-                    out.put("ready", !pref(context, KEY_API_KEY, "").isEmpty());
+                    putStatus(out);
                     return out;
+                }
+            });
+        }
+
+        @JavascriptInterface
+        public void moderate(final String messageId, final String channelId) {
+            run("moderate", new JSONObject(), new Job() {
+                @Override
+                public JSONObject execute(JSONObject args) throws Exception {
+                    JSONObject result = performStreamerModeration(context, null, messageId, channelId, false);
+                    result.put("id", messageId == null ? "" : messageId);
+                    return result;
                 }
             });
         }
@@ -911,7 +991,7 @@ public final class TkProtect {
             // ignored
         }
         Verdict verdict = checkText(context, text);
-        if (key != null) {
+        if (key != null && verdict != null && !"error".equals(verdict.type)) {
             if (VERDICTS.size() > 300) {
                 VERDICTS.clear();
             }
@@ -1572,55 +1652,191 @@ public final class TkProtect {
         return "";
     }
 
-    private static void maybeAutoDeleteChatMessage(Context context, JSONObject item, Verdict verdict) {
+    private static boolean streamerManualAction(Context context) {
+        return "manual".equals(pref(context, KEY_STREAMER_ACTION, "auto_delete"));
+    }
+
+    private static String streamerBanMode(Context context) {
+        String mode = pref(context, KEY_STREAMER_BAN_MODE, "off");
+        if ("timeout".equals(mode) || "permanent".equals(mode)) {
+            return mode;
+        }
+        return "off";
+    }
+
+    private static int streamerBanSeconds(Context context) {
+        try {
+            int value = Integer.parseInt(pref(context, KEY_STREAMER_BAN_SECONDS, "300"));
+            return value > 0 ? value : 300;
+        } catch (NumberFormatException ignored) {
+            return 300;
+        }
+    }
+
+    private static String effectiveLiveChatId(Context context) {
+        if ("1".equals(pref(context, KEY_STREAMER_MANUAL_BIND, "0"))) {
+            String manual = pref(context, KEY_STREAMER_MANUAL_LIVE_CHAT_ID, "").trim();
+            if (!manual.isEmpty()) {
+                return manual;
+            }
+        }
+        return pref(context, KEY_STREAMER_LIVE_CHAT_ID, "").trim();
+    }
+
+    private static void maybeAutoModerateChatMessage(Context context, JSONObject item, Verdict verdict) {
         if (!verdict.bad) {
             return;
         }
-        if (!isStreamerMode(context)) {
-            return;
-        }
-        if (!hasGoogleTokens(context)) {
+        if (!isStreamerMode(context) || !hasGoogleTokens(context)) {
             return;
         }
         String messageId = item.optString("id", "");
-        if (messageId.isEmpty() || DELETED_MESSAGES.containsKey(messageId)) {
+        if (messageId.isEmpty()) {
             return;
         }
+        if (DELETED_MESSAGES.containsKey(messageId)) {
+            try { item.put("deletedByStreamer", true); } catch (Exception ignored) {}
+            return;
+        }
+        if (streamerManualAction(context)) {
+            try { item.put("actionPending", true); } catch (Exception ignored) {}
+            return;
+        }
+        performStreamerModeration(context, item, messageId, item.optString("channelId", ""), true);
+    }
+
+    private static JSONObject performStreamerModeration(Context context, JSONObject item,
+                                                        String messageId, String channelId,
+                                                        boolean fromAuto) {
+        JSONObject result = new JSONObject();
+        try {
+            if (messageId == null || messageId.isEmpty()) {
+                result.put("ok", false);
+                result.put("error", "no_message_id");
+                return result;
+            }
+            if (DELETED_MESSAGES.containsKey(messageId)) {
+                result.put("ok", true);
+                result.put("deleted", true);
+                result.put("already", true);
+                if (item != null) item.put("deletedByStreamer", true);
+                return result;
+            }
+            String deleteError = deleteLiveChatMessage(context, messageId);
+            boolean deleted = deleteError == null;
+            result.put("deleted", deleted);
+            if (deleted) {
+                rememberDeleted(messageId);
+                if (item != null) item.put("deletedByStreamer", true);
+            } else {
+                result.put("deleteError", deleteError);
+                if (item != null) item.put("deleteError", deleteError);
+            }
+            String banMode = streamerBanMode(context);
+            if (!"off".equals(banMode) && channelId != null && !channelId.isEmpty()) {
+                String banError = banChatAuthor(context, channelId, banMode, streamerBanSeconds(context));
+                boolean banned = banError == null;
+                result.put("banned", banned);
+                result.put("banMode", banMode);
+                if (banned) {
+                    if (item != null) item.put("bannedByStreamer", true);
+                } else {
+                    result.put("banError", banError);
+                    if (item != null) item.put("banError", banError);
+                }
+            }
+            result.put("ok", deleted || result.optBoolean("banned", false));
+            if (item != null) item.put("actionPending", false);
+        } catch (Exception ex) {
+            try {
+                result.put("ok", false);
+                result.put("error", String.valueOf(ex.getMessage()));
+            } catch (Exception ignored) {}
+        }
+        return result;
+    }
+
+    private static String deleteLiveChatMessage(Context context, String messageId) {
         try {
             String token = ensureGoogleAccessToken(context);
             String url = YT_API_BASE + "/liveChat/messages?id=" + enc(messageId);
             HttpResponse response = requestRaw(url, "DELETE", null, null, "Bearer " + token);
             if (response.code == 204 || response.code == 200) {
-                item.put("deletedByStreamer", true);
-                rememberDeleted(messageId);
-            } else if (response.code == 401) {
+                return null;
+            }
+            if (response.code == 401) {
                 savePref(context, KEY_GOOGLE_ACCESS_TOKEN, "");
                 token = ensureGoogleAccessToken(context);
                 response = requestRaw(url, "DELETE", null, null, "Bearer " + token);
                 if (response.code == 204 || response.code == 200) {
-                    item.put("deletedByStreamer", true);
-                    rememberDeleted(messageId);
-                } else {
-                    item.put("deleteError", "HTTP " + response.code);
-                    Log.w(TAG, "Delete failed after refresh: " + response.code + " " + response.body);
+                    return null;
                 }
-            } else if (response.code == 404 || response.code == 403) {
-                // not found/already gone/not allowed for this message - don't retry forever
-                item.put("deleteError", "HTTP " + response.code);
+            }
+            if (response.code == 404 || response.code == 403) {
+                // not found/already gone/not allowed - avoid retry loops
                 rememberDeleted(messageId);
-                Log.w(TAG, "Delete not applicable: " + response.code + " " + response.body);
-            } else {
-                item.put("deleteError", "HTTP " + response.code);
-                Log.w(TAG, "Delete failed: " + response.code + " " + response.body);
+                return "HTTP " + response.code;
             }
+            return "HTTP " + response.code + ": " + compactError(response.body);
         } catch (Exception ex) {
-            try {
-                item.put("deleteError", String.valueOf(ex.getMessage()));
-            } catch (Exception ignored) {
-                // ignored
-            }
-            Log.w(TAG, "Auto-delete failed for " + messageId, ex);
+            Log.w(TAG, "Delete failed for " + messageId, ex);
+            return String.valueOf(ex.getMessage());
         }
+    }
+
+    private static String banChatAuthor(Context context, String channelId, String mode, int seconds) {
+        try {
+            String token = ensureGoogleAccessToken(context);
+            JSONObject channel = new JSONObject().put("channelId", channelId);
+            JSONObject details = new JSONObject();
+            details.put("type", "permanent".equals(mode) ? "permanent" : "temporary");
+            if (!"permanent".equals(mode)) {
+                details.put("banDurationSeconds", Math.max(60, seconds));
+            }
+            JSONObject snippet = new JSONObject();
+            snippet.put("bannedUserDetails", channel);
+            snippet.put("banDurationSeconds", details.optInt("banDurationSeconds", 0));
+            snippet.put("type", details.optString("type"));
+            // liveChatId is optional if in live chat context? but better to include if known
+            String liveChatId = effectiveLiveChatId(context);
+            if (!liveChatId.isEmpty()) {
+                snippet.put("liveChatId", liveChatId);
+            }
+            JSONObject body = new JSONObject();
+            body.put("snippet", snippet);
+            String url = YT_API_BASE + "/liveChat/bans?part=snippet";
+            HttpResponse response = requestRaw(url, "POST", body.toString(),
+                    "application/json; charset=utf-8", "Bearer " + token);
+            if (response.code >= 200 && response.code < 300) {
+                return null;
+            }
+            if (response.code == 401) {
+                savePref(context, KEY_GOOGLE_ACCESS_TOKEN, "");
+                token = ensureGoogleAccessToken(context);
+                response = requestRaw(url, "POST", body.toString(),
+                        "application/json; charset=utf-8", "Bearer " + token);
+                if (response.code >= 200 && response.code < 300) {
+                    return null;
+                }
+            }
+            return "HTTP " + response.code + ": " + compactError(response.body);
+        } catch (Exception ex) {
+            Log.w(TAG, "Ban failed for " + channelId, ex);
+            return String.valueOf(ex.getMessage());
+        }
+    }
+
+    private static String compactError(String body) {
+        if (body == null || body.isEmpty()) return "";
+        try {
+            JSONObject json = new JSONObject(body);
+            JSONObject err = json.optJSONObject("error");
+            if (err != null) {
+                String msg = err.optString("message", "");
+                if (!msg.isEmpty()) return msg;
+            }
+        } catch (Exception ignored) {}
+        return body.length() > 200 ? body.substring(0, 200) + "..." : body;
     }
 
     private static void rememberDeleted(String messageId) {
@@ -1785,36 +2001,48 @@ public final class TkProtect {
                 "<label class=muted><input type=checkbox id=force style='width:auto'> Показывать скрытые</label>",
                 "<div class=log id=log></div></div>",
                 "<script>",
-                "let tab='chat',videoId='',chat=[],comments=[],ready=false,resetChat=true,resetComments=true;",
+                "let tab='chat',videoId='',chat=[],comments=[],ready=false,resetChat=true,resetComments=true,streamerAction='auto_delete',userMode='viewer',streamerLinked=false;",
                 "const $=id=>document.getElementById(id);",
                 "function log(m){const l=$('log');l.innerHTML='<div>'+new Date().toLocaleTimeString()+' — '+m+'</div>'+l.innerHTML}",
                 "function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')",
                 ".replace(/>/g,'&gt;').replace(/\"/g,'&quot;')}",
+                "function escJs(s){return String(s==null?'':s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,\"\\\\'\")}",
+                "function mod(id,ch){log('Модерация: '+id);TK.moderate(id,ch||'')}",
                 "function render(list,el,hide){if(!list.length){el.innerHTML='<p class=empty>Пусто.</p>';return}",
-                "el.innerHTML=list.map(x=>{const off=x.hidden&&!hide;const extra=x.deletedByStreamer?' · удалено из чата (YouTube)':(x.deleteError?' · ошибка удаления':'');",
+                "el.innerHTML=list.map(x=>{const off=x.hidden&&!hide;const extra=x.deletedByStreamer?' · удалено из чата (YouTube)':(x.bannedByStreamer?' · нарушитель заблокирован':'')+(x.deleteError?' · ошибка удаления':'')+(x.banError?' · ошибка бана':'');",
+                "const canMod=userMode==='streamer'&&streamerLinked&&streamerAction==='manual'&&x.verdict&&x.verdict.bad&&x.actionPending&&!x.deletedByStreamer&&x.id;",
+                "const btn=canMod?'<div><button onclick=\"mod(\\''+escJs(x.id)+'\\',\\''+escJs(x.channelId||'')+'\\')\">Удалить'+(x.channelId?' / применить бан':'')+'</button></div>':'';",
                 "return '<div class=\"item'+(off?' hidden':'')+'\"><div class=meta><b>'+esc(x.author||'Аноним')+'</b>',",
                 "+(x.publishedAt?'<span>'+esc(x.publishedAt)+'</span>':'')+'</div><div class=text'+(off?' masked':'')+'>'",
                 "+(off?'Скрыто TKProtect':esc(x.text))+'</div>'+(x.verdict&&!off&&x.verdict.bad?",
-                "'<div class=bad>'+esc(x.verdict.label+extra)+'</div>':(extra?'<div class=bad>'+esc(extra.slice(3))+'</div>':''))+'</div>'}).join('')}",
+                "'<div class=bad>'+esc(x.verdict.label+extra)+'</div>':(extra?'<div class=bad>'+esc(extra.replace(/^ · /,''))+'</div>':''))+btn+'</div>'}).join('')}",
                 "function refresh(){render(chat,$('chat'),$('force').checked);",
                 "render(comments,$('comments'),$('force').checked);",
                 "$('nChecked').textContent=chat.length+comments.length;",
                 "$('nHidden').textContent=chat.filter(x=>x.hidden).length+comments.filter(x=>x.hidden).length}",
                 "function merge(old,next){const seen=new Set(old.map(x=>x.id).filter(Boolean));",
                 "return old.concat(next.filter(x=>{if(x.id&&seen.has(x.id))return false;if(x.id)seen.add(x.id);return true})).slice(-300)}",
-                "window.tkpOnBootstrap=d=>{ready=!!d.ready;const k=d.keyMask?(' · ключ '+d.keyMask):'';const v=d.apiVersion?(' · API '+d.apiVersion):'';",
-                "const m=d.userMode==='streamer'?(d.streamerLinked?' · Стример: авто-удаление':' · Стример: Google не привязан'):' · Зритель';",
+                "function applyStatus(d){if(!d||d.ready===undefined)return;ready=!!d.ready;if(d.streamerAction)streamerAction=d.streamerAction;if(d.userMode)userMode=d.userMode;streamerLinked=!!d.streamerLinked;",
+                "const k=d.keyMask?(' · ключ '+d.keyMask):'';const v=d.apiVersion?(' · API '+d.apiVersion):'';",
+                "const act=streamerAction==='manual'?'ручное подтверждение':'авто-удаление';",
+                "const m=userMode==='streamer'?(streamerLinked?' · Стример: '+act:' · Стример: Google не привязан'):' · Зритель';",
                 "$('status').textContent=ready?('TKProtect активен'+k+v+m):'TKCore ключ не сохранён (длина '+(d.keyLen||0)+') — долгий тап по TK, вставьте ключ и нажмите «Сохранить»';",
-                "log(ready?('Готово'+k+v+m):'Ключ не сохранён')}",
+                "return k+v+m}",
+                "window.tkpOnBootstrap=d=>{const s=applyStatus(d);if(s!==undefined)log(ready?('Готово'+s):'Ключ не сохранён')}",
                 "window.tkpOnCheck=d=>{$('checkResult').className=d.bad?'bad':'muted';",
                 "$('checkResult').textContent=(d.label||d.type||'')+(d.error?' — '+d.error:'')}",
+                "window.tkpOnModerate=d=>{const id=d.id||'';const item=chat.find(x=>x.id===id);",
+                "if(item){if(d.deleted)item.deletedByStreamer=true;if(d.banned)item.bannedByStreamer=true;",
+                "if(d.deleteError)item.deleteError=d.deleteError;if(d.banError)item.banError=d.banError;",
+                "if(d.ok||d.deleted||d.banned||d.deleteError||d.banError)item.actionPending=false;}",
+                "log('Модерация '+id+': '+(d.ok?'выполнено':'ошибка')+(d.error?(' — '+d.error):''));refresh()}",
                 "window.tkpOnVideo=d=>{const v=d.video||'';if(!/^[A-Za-z0-9_-]{11}$/.test(v))return;",
                 "if(v!==videoId){$('video').value=v;connect(v);log('Видео из плеера: '+v)}}",
-                "window.tkpOnChat=d=>{if(d.error==='no_active_live_chat'&&tab==='chat'){switchTab('comments');",
+                "window.tkpOnChat=d=>{applyStatus(d);if(d.error==='no_active_live_chat'&&tab==='chat'){switchTab('comments');",
                 "log('У видео нет живого чата — открыты комментарии')}",
                 "if(d.error)log('Чат: '+d.error);chat=resetChat?d.messages:merge(chat,d.messages);",
                 "resetChat=false;refresh()}",
-                "window.tkpOnComments=d=>{if(d.error)log('Комментарии: '+d.error);comments=resetComments?d.comments:merge(comments,d.comments);",
+                "window.tkpOnComments=d=>{applyStatus(d);if(d.error)log('Комментарии: '+d.error);comments=resetComments?d.comments:merge(comments,d.comments);",
                 "resetComments=false;refresh()}",
                 "$('connect').onclick=()=>connect($('video').value.trim());",
                 "function connect(v){if(!/^[A-Za-z0-9_-]{11}$/.test(v)){alert('Откройте видео или введите ID из 11 символов');return}",

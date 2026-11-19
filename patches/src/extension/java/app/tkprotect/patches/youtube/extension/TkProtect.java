@@ -33,6 +33,7 @@ import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -570,7 +571,9 @@ public final class TkProtect {
         contextObj.put("client", client);
         JSONObject body = new JSONObject();
         body.put("context", contextObj);
-        for (String key : extra.keySet()) {
+        Iterator<String> extraKeys = extra.keys();
+        while (extraKeys.hasNext()) {
+            String key = extraKeys.next();
             body.put(key, extra.get(key));
         }
         String key = pref(context, KEY_INNERTUBE_KEY, DEF_INNERTUBE_KEY);
@@ -589,7 +592,9 @@ public final class TkProtect {
             Object current = stack.remove(stack.size() - 1);
             if (current instanceof JSONObject) {
                 JSONObject object = (JSONObject) current;
-                for (String name : object.keySet()) {
+                Iterator<String> names = object.keys();
+                while (names.hasNext()) {
+                    String name = names.next();
                     Object value = object.get(name);
                     if (key.equals(name)) {
                         found.add(value);
@@ -814,7 +819,7 @@ public final class TkProtect {
                 }
             }
         }
-        return tokens.isEmpty() ? "" : tokens.get(tokens.size() - 1);
+        return tokens.isEmpty() ? "" : String.valueOf(tokens.get(tokens.size() - 1));
     }
 
     private static JSONObject commentsPage(Context context, String videoId, String continuation)

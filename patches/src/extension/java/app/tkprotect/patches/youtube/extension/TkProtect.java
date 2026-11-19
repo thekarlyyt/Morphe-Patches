@@ -1691,7 +1691,7 @@ public final class TkProtect {
     }
 
     /** Merges every ytcfg.set(...) object found in a watch page. */
-    private static JSONObject parseYoutubeConfig(String html) {
+    private static JSONObject parseYoutubeConfig(String html) throws Exception {
         JSONObject result = new JSONObject();
         int searchIndex = 0;
         while (searchIndex < html.length()) {

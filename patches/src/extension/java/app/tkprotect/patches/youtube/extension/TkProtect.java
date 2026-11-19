@@ -39,9 +39,11 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
@@ -100,11 +102,20 @@ public final class TkProtect {
     private static final String GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code";
     private static final String GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
     private static final String YT_API_BASE = "https://www.googleapis.com/youtube/v3";
+    private static final String YOUTUBE_ORIGIN = "https://www.youtube.com";
+    private static final String YT_WEB_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    + "(KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
+    private static final String[] INITIAL_DATA_MARKERS = {
+            "var ytInitialData =", "ytInitialData =",
+            "window[\"ytInitialData\"] =", "id=\"yt-initial-data\""
+    };
 
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Map<String, String> CHAT_CONTINUATIONS = new HashMap<>();
     private static final Map<String, String> COMMENT_CONTINUATIONS = new HashMap<>();
+    private static final Map<String, CommentsState> COMMENT_STATES = new HashMap<>();
     private static final Map<String, Verdict> VERDICTS = new LinkedHashMap<>();
     private static final Map<String, Boolean> DELETED_MESSAGES = new LinkedHashMap<>();
 
@@ -772,6 +783,7 @@ public final class TkProtect {
                     }
                     if (reset) {
                         COMMENT_CONTINUATIONS.remove(videoId);
+                        COMMENT_STATES.remove(videoId);
                     }
                     String continuation = COMMENT_CONTINUATIONS.get(videoId);
                     if (continuation == null) {
@@ -779,10 +791,27 @@ public final class TkProtect {
                     }
                     JSONObject page = commentsPage(context, videoId, continuation);
                     String next = page.optString("continuation", "");
+                    JSONArray source = page.optJSONArray("comments");
+                    // YouTube often returns only a continuation token in the first "next" reply;
+                    // follow it immediately so the comments tab is not empty on first open.
+                    if ((source == null || source.length() == 0) && !next.isEmpty()) {
+                        JSONObject follow = commentsPage(context, videoId, next);
+                        JSONArray followComments = follow.optJSONArray("comments");
+                        if (followComments != null && followComments.length() > 0) {
+                            page = follow;
+                            source = followComments;
+                            String followNext = follow.optString("continuation", "");
+                            if (!followNext.isEmpty()) {
+                                next = followNext;
+                            }
+                        }
+                    }
                     if (!next.isEmpty() && !next.equals(continuation)) {
                         COMMENT_CONTINUATIONS.put(videoId, next);
                     }
-                    JSONArray source = page.optJSONArray("comments");
+                    if (source == null) {
+                        source = new JSONArray();
+                    }
                     JSONArray outComments = new JSONArray();
                     for (int i = 0; i < source.length(); i++) {
                         JSONObject item = source.getJSONObject(i);
@@ -796,6 +825,7 @@ public final class TkProtect {
                     out.put("video", videoInfo(context, videoId));
                     out.put("comments", outComments);
                     out.put("error", page.optString("error", ""));
+                    out.put("hasContinuation", !next.isEmpty());
                     putStatus(out);
                     return out;
                 }
@@ -1030,25 +1060,27 @@ public final class TkProtect {
             return new Verdict("error", "Нет API key — откройте настройки", false);
         }
         String configured = pref(context, KEY_VERSION, DEF_VERSION);
-        if ("auto".equalsIgnoreCase(configured) || configured.isEmpty()) {
+        boolean auto = "auto".equalsIgnoreCase(configured) || configured.isEmpty();
+        if (auto) {
             configured = "1.0";
         }
-        String preferred = workingVersion.isEmpty() ? configured : workingVersion;
+        // With an explicitly chosen version, always use it; the remembered version is only
+        // meaningful for "auto" mode. Otherwise a temporary fallback could stick and make the
+        // panel show a version the user did not select.
+        String preferred = auto && !workingVersion.isEmpty() ? workingVersion : configured;
         Verdict verdict = checkTextVersioned(context, text, preferred, apiKey);
         if (!"error".equals(verdict.type)) {
-            workingVersion = preferred;
+            if (auto) {
+                workingVersion = preferred;
+            }
             return verdict;
         }
-        if (preferred.equals(configured)) {
-            String alternate = "1.0".equals(configured) ? "2.0" : "1.0";
-            Verdict retry = checkTextVersioned(context, text, alternate, apiKey);
-            if (!"error".equals(retry.type)) {
-                workingVersion = alternate;
-                return retry;
-            }
-            return retry;
+        String alternate = "1.0".equals(preferred) ? "2.0" : "1.0";
+        Verdict retry = checkTextVersioned(context, text, alternate, apiKey);
+        if (!"error".equals(retry.type) && auto) {
+            workingVersion = alternate;
         }
-        return verdict;
+        return retry;
     }
 
     private static Verdict checkTextVersioned(Context context, String text, String version, String apiKey) {
@@ -1076,15 +1108,14 @@ public final class TkProtect {
         }
     }
 
-    /** The version that actually answers this key, for display in the panel. */
+    /** The version used for checks, for display in the panel. */
     private static String activeVersion(Context context) {
-        if (!workingVersion.isEmpty()) {
-            return workingVersion;
-        }
         String configured = pref(context, KEY_VERSION, DEF_VERSION);
         if ("auto".equalsIgnoreCase(configured) || configured.isEmpty()) {
-            return "авто";
+            return workingVersion.isEmpty() ? "авто" : workingVersion;
         }
+        // An explicitly chosen version must always be shown, even if a temporary probe
+        // remembered a different one (that value is only meaningful for "auto").
         return configured;
     }
 
@@ -1366,30 +1397,92 @@ public final class TkProtect {
         return out;
     }
 
-    private static JSONArray extractComments(Object node) {
+    /** Parses top-level comments from frameworkUpdates.entityBatchUpdate.mutations. */
+    private static JSONArray parseEntityComments(JSONObject response) {
         JSONArray out = new JSONArray();
-        for (Object value : walk(node, "commentRenderer")) {
-            if (!(value instanceof JSONObject)) {
+        JSONObject batch = objectPath(response, "frameworkUpdates", "entityBatchUpdate");
+        JSONArray mutations = batch == null ? null : batch.optJSONArray("mutations");
+        Set<String> seen = new HashSet<>();
+        for (int i = 0; mutations != null && i < mutations.length(); i++) {
+            JSONObject properties = objectPath(mutations.optJSONObject(i),
+                    "payload", "commentEntityPayload", "properties");
+            if (properties == null || properties.optInt("replyLevel") != 0) {
                 continue;
             }
-            JSONObject item = (JSONObject) value;
-            String id = item.optString("commentId", "");
-            String text = textOf(item.opt("contentText"));
-            if (id.isEmpty() && text.isEmpty()) {
+            String id = properties.optString("commentId", "");
+            JSONObject content = properties.optJSONObject("content");
+            String text = content == null ? "" : content.optString("content", "");
+            if (text.isEmpty() && id.isEmpty()) {
+                continue;
+            }
+            if (!seen.add(id.isEmpty() ? text : id)) {
                 continue;
             }
             try {
                 JSONObject row = new JSONObject();
                 row.put("id", id);
                 row.put("text", text);
-                row.put("author", textOf(item.opt("authorText")));
-                row.put("publishedAt", textOf(item.opt("publishedTimeText")));
+                row.put("author", firstText(properties, "displayName", "authorText", "author"));
+                row.put("publishedAt", firstText(properties, "publishedTimeText", "publishedTime"));
                 out.put(row);
             } catch (Exception ignored) {
                 // ignored
             }
         }
         return out;
+    }
+
+    private static JSONArray extractComments(Object node) {
+        JSONArray out = new JSONArray();
+        Set<String> seen = new HashSet<>();
+        // Modern YouTube responses often use commentViewModel/commentEntityPayload instead of
+        // the legacy commentRenderer, so collect from all known shapes and dedupe by id/text.
+        String[] rendererKeys = {"commentRenderer", "commentViewModel", "commentEntityPayload",
+                "commentThreadRenderer"};
+        for (String rendererKey : rendererKeys) {
+            for (Object value : walk(node, rendererKey)) {
+                if (!(value instanceof JSONObject)) {
+                    continue;
+                }
+                JSONObject item = (JSONObject) value;
+                String id = firstText(item, "commentId", "commentIdentifier", "id");
+                String text = firstText(item, "contentText", "content", "text", "contentText");
+                String author = firstText(item, "authorText", "authorName", "author");
+                String published = firstText(item, "publishedTimeText", "publishedTime", "dateText");
+                if (text.isEmpty() && id.isEmpty()) {
+                    continue;
+                }
+                String dedupe = id.isEmpty() ? author + "|" + text : id;
+                if (seen.contains(dedupe)) {
+                    continue;
+                }
+                seen.add(dedupe);
+                try {
+                    JSONObject row = new JSONObject();
+                    row.put("id", id);
+                    row.put("text", text);
+                    row.put("author", author);
+                    row.put("publishedAt", published);
+                    out.put(row);
+                } catch (Exception ignored) {
+                    // ignored
+                }
+            }
+        }
+        return out;
+    }
+
+    /** Returns the first non-empty text found under any of the given keys in a subtree. */
+    private static String firstText(Object node, String... keys) {
+        for (String key : keys) {
+            for (Object value : walk(node, key)) {
+                String text = textOf(value);
+                if (!text.isEmpty()) {
+                    return text;
+                }
+            }
+        }
+        return "";
     }
 
     private static String commentsContinuation(Object node) {
@@ -1458,15 +1551,311 @@ public final class TkProtect {
         return "";
     }
 
+    /** Watch-page configuration needed to request comment pages from Innertube. */
+    private static final class CommentsState {
+        final String apiKey;
+        final String clientVersion;
+        final JSONObject context;
+        final String visitorData;
+        final String continuation;
+
+        CommentsState(String apiKey, String clientVersion, JSONObject context,
+                      String visitorData, String continuation) {
+            this.apiKey = apiKey;
+            this.clientVersion = clientVersion;
+            this.context = context;
+            this.visitorData = visitorData;
+            this.continuation = continuation;
+        }
+    }
+
+    /**
+     * Loads the watch page and extracts the Innertube client context plus the comments-section
+     * continuation token. Morphe's Niconico comments use the same flow; it is the only reliable
+     * way to get comments from current YouTube clients.
+     */
+    private static CommentsState fetchCommentsState(Context context, String videoId) throws Exception {
+        String watchUrl = YOUTUBE_ORIGIN + "/watch?v=" + enc(videoId)
+                + "&hl=en&bpctr=9999999999&has_verified=1";
+        HttpResponse page = requestYouTube(watchUrl, "GET", null, null, null, null);
+        String html = page.body;
+
+        JSONObject config = parseYoutubeConfig(html);
+        String apiKey = config.optString("INNERTUBE_API_KEY", "");
+        JSONObject innertubeContext = config.optJSONObject("INNERTUBE_CONTEXT");
+        String clientVersion = "";
+        if (innertubeContext != null) {
+            JSONObject client = innertubeContext.optJSONObject("client");
+            if (client != null) {
+                clientVersion = client.optString("clientVersion", "");
+            }
+        }
+        if (clientVersion.isEmpty()) {
+            clientVersion = config.optString("INNERTUBE_CLIENT_VERSION", "");
+        }
+        String visitorData = config.optString("VISITOR_DATA", "");
+        if (visitorData.isEmpty() && innertubeContext != null) {
+            JSONObject client = innertubeContext.optJSONObject("client");
+            if (client != null) {
+                visitorData = client.optString("visitorData", "");
+            }
+        }
+        if (apiKey.isEmpty()) {
+            apiKey = pref(context, KEY_INNERTUBE_KEY, DEF_INNERTUBE_KEY);
+        }
+        if (clientVersion.isEmpty()) {
+            clientVersion = pref(context, KEY_CLIENT_VERSION, DEF_CLIENT_VERSION);
+        }
+        if (innertubeContext == null) {
+            innertubeContext = new JSONObject();
+            JSONObject client = new JSONObject();
+            client.put("clientName", "WEB");
+            client.put("clientVersion", clientVersion);
+            if (!visitorData.isEmpty()) {
+                client.put("visitorData", visitorData);
+            }
+            innertubeContext.put("client", client);
+            innertubeContext.put("request", new JSONObject().put("useSsl", true));
+        }
+        JSONObject initialData = parseMarkedObject(html, INITIAL_DATA_MARKERS);
+        String continuation = initialData == null ? "" : findCommentsContinuation(initialData);
+        return new CommentsState(apiKey, clientVersion, innertubeContext, visitorData, continuation);
+    }
+
+    /** Posts to an Innertube endpoint with the watch-page context and client headers. */
+    private static JSONObject postInnertube(CommentsState state, String path, JSONObject body)
+            throws Exception {
+        String endpoint = YOUTUBE_ORIGIN + "/youtubei/v1/" + path + "?key="
+                + enc(state.apiKey) + "&prettyPrint=false";
+        body.put("context", state.context);
+        HttpResponse response = requestYouTube(endpoint, "POST", body.toString(),
+                state.clientVersion, state.visitorData, "application/json");
+        String raw = response.body;
+        int brace = raw.indexOf('{');
+        if (brace > 0) {
+            raw = raw.substring(brace);
+        }
+        return new JSONObject(raw);
+    }
+
+    /** HTTP helper with a browser user agent and the YouTube client headers. */
+    private static HttpResponse requestYouTube(String url, String method, String body,
+                                               String clientVersion, String visitorData,
+                                               String contentType) throws Exception {
+        HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
+        try {
+            connection.setRequestMethod(method);
+            connection.setConnectTimeout(20000);
+            connection.setReadTimeout(20000);
+            connection.setInstanceFollowRedirects(true);
+            connection.setUseCaches(false);
+            connection.setRequestProperty("User-Agent", YT_WEB_USER_AGENT);
+            connection.setRequestProperty("Accept-Language", "en-US,en;q=0.9");
+            if (body != null) {
+                connection.setDoOutput(true);
+                connection.setRequestProperty("Content-Type",
+                        contentType == null ? "application/json" : contentType);
+                connection.setRequestProperty("Origin", YOUTUBE_ORIGIN);
+                connection.setRequestProperty("X-Youtube-Client-Name", "1");
+                if (clientVersion != null && !clientVersion.isEmpty()) {
+                    connection.setRequestProperty("X-Youtube-Client-Version", clientVersion);
+                }
+                if (visitorData != null && !visitorData.isEmpty()) {
+                    connection.setRequestProperty("X-Goog-Visitor-Id", visitorData);
+                }
+                byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+                connection.setFixedLengthStreamingMode(bytes.length);
+                OutputStream stream = connection.getOutputStream();
+                try {
+                    stream.write(bytes);
+                } finally {
+                    stream.close();
+                }
+            }
+            int code = connection.getResponseCode();
+            InputStream stream = code >= 400 ? connection.getErrorStream() : connection.getInputStream();
+            if (stream == null) {
+                return new HttpResponse(code, "");
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = stream.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+            }
+            stream.close();
+            return new HttpResponse(code, out.toString("UTF-8"));
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    /** Merges every ytcfg.set(...) object found in a watch page. */
+    private static JSONObject parseYoutubeConfig(String html) {
+        JSONObject result = new JSONObject();
+        int searchIndex = 0;
+        while (searchIndex < html.length()) {
+            int markerIndex = html.indexOf("ytcfg.set(", searchIndex);
+            if (markerIndex < 0) {
+                break;
+            }
+            JSONObject value = parseObjectAt(html, markerIndex + "ytcfg.set(".length());
+            if (value != null) {
+                Iterator<String> keys = value.keys();
+                while (keys.hasNext()) {
+                    String key = keys.next();
+                    result.put(key, value.opt(key));
+                }
+            }
+            searchIndex = markerIndex + "ytcfg.set(".length();
+        }
+        return result;
+    }
+
+    private static JSONObject parseMarkedObject(String text, String... markers) {
+        for (String marker : markers) {
+            int markerIndex = text.indexOf(marker);
+            if (markerIndex >= 0) {
+                JSONObject value = parseObjectAt(text, markerIndex + marker.length());
+                if (value != null) {
+                    return value;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Parses the first balanced JSON object starting at or after startIndex. */
+    private static JSONObject parseObjectAt(String text, int startIndex) {
+        int start = text.indexOf('{', startIndex);
+        if (start < 0) {
+            return null;
+        }
+        int depth = 0;
+        boolean inString = false;
+        boolean escaped = false;
+        for (int index = start; index < text.length(); index++) {
+            char value = text.charAt(index);
+            if (inString) {
+                if (escaped) {
+                    escaped = false;
+                } else if (value == '\\') {
+                    escaped = true;
+                } else if (value == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (value == '"') {
+                inString = true;
+            } else if (value == '{') {
+                depth++;
+            } else if (value == '}') {
+                depth--;
+                if (depth == 0) {
+                    try {
+                        return new JSONObject(text.substring(start, index + 1));
+                    } catch (Exception ex) {
+                        Log.w(TAG, "Could not parse embedded JSON", ex);
+                        return null;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Navigates a nested object by keys, returning null if any step is missing. */
+    private static JSONObject objectPath(Object node, String... keys) {
+        Object current = node;
+        for (String key : keys) {
+            if (!(current instanceof JSONObject)) {
+                return null;
+            }
+            current = ((JSONObject) current).opt(key);
+        }
+        return current instanceof JSONObject ? (JSONObject) current : null;
+    }
+
+    /** Finds the comments-section continuation token in ytInitialData. */
+    private static String findCommentsContinuation(JSONObject initialData) {
+        JSONObject results = objectPath(initialData,
+                "contents", "twoColumnWatchNextResults", "results", "results");
+        JSONArray contents = results == null ? null : results.optJSONArray("contents");
+        if (contents == null) {
+            return "";
+        }
+        for (int i = 0; i < contents.length(); i++) {
+            JSONObject section = objectPath(contents.optJSONObject(i), "itemSectionRenderer");
+            if (section != null && "comment-item-section".equals(section.optString("sectionIdentifier"))) {
+                return lastContinuationToken(section.optJSONArray("contents"));
+            }
+        }
+        return "";
+    }
+
+    /** Returns the token of the last continuationItemRenderer in an array. */
+    private static String lastContinuationToken(JSONArray items) {
+        if (items == null || items.length() == 0) {
+            return "";
+        }
+        JSONObject command = objectPath(items.optJSONObject(items.length() - 1),
+                "continuationItemRenderer", "continuationEndpoint", "continuationCommand");
+        return command == null ? "" : command.optString("token", "");
+    }
+
+    /** Extracts the next comments-page token from an Innertube "next" response. */
+    private static String commentsContinuationFromNext(JSONObject response) {
+        String token = "";
+        JSONArray endpoints = response.optJSONArray("onResponseReceivedEndpoints");
+        for (int i = 0; endpoints != null && i < endpoints.length(); i++) {
+            JSONObject endpoint = endpoints.optJSONObject(i);
+            JSONObject command = objectPath(endpoint, "appendContinuationItemsAction");
+            if (command == null) {
+                command = objectPath(endpoint, "reloadContinuationItemsCommand");
+            }
+            String found = lastContinuationToken(command == null ? null
+                    : command.optJSONArray("continuationItems"));
+            if (!found.isEmpty()) {
+                token = found;
+            }
+        }
+        if (token.isEmpty()) {
+            token = commentsContinuation(response);
+        }
+        return token;
+    }
+
     private static JSONObject commentsPage(Context context, String videoId, String continuation)
             throws Exception {
-        JSONObject extra = continuation.isEmpty()
-                ? new JSONObject().put("videoId", videoId)
-                : new JSONObject().put("continuation", continuation);
-        JSONObject response = innertube(context, "next", extra);
-        String next = commentsContinuation(response);
+        CommentsState state = COMMENT_STATES.get(videoId);
+        if (state == null) {
+            state = fetchCommentsState(context, videoId);
+            COMMENT_STATES.put(videoId, state);
+        }
+        String token = continuation.isEmpty() ? state.continuation : continuation;
+        if (token.isEmpty()) {
+            JSONObject out = new JSONObject();
+            out.put("comments", new JSONArray());
+            out.put("continuation", "");
+            out.put("hasContinuation", false);
+            out.put("error", "no_comments_continuation");
+            return out;
+        }
+        JSONObject response = postInnertube(state, "next",
+                new JSONObject().put("continuation", token));
+        String next = commentsContinuationFromNext(response);
+        JSONArray comments = parseEntityComments(response);
+        if (comments.length() == 0) {
+            comments = extractComments(response);
+            if (comments.length() == 0) {
+                String dump = response.toString();
+                Log.w(TAG, "No comments parsed. Response snippet: "
+                        + dump.substring(0, Math.min(500, dump.length())));
+            }
+        }
         JSONObject out = new JSONObject();
-        out.put("comments", extractComments(response));
+        out.put("comments", comments);
         out.put("continuation", next);
         out.put("hasContinuation", !next.isEmpty());
         out.put("error", "");

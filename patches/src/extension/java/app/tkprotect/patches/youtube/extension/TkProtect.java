@@ -13,10 +13,13 @@ import android.view.View;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -69,25 +72,42 @@ public final class TkProtect {
     private static final String KEY_VERSION = "tk_version";
     private static final String KEY_INNERTUBE_KEY = "innertube_key";
     private static final String KEY_CLIENT_VERSION = "client_version";
+    private static final String KEY_USER_MODE = "user_mode"; // viewer | streamer
+    private static final String KEY_GOOGLE_CLIENT_ID = "google_client_id";
+    private static final String KEY_GOOGLE_CLIENT_SECRET = "google_client_secret";
+    private static final String KEY_GOOGLE_ACCESS_TOKEN = "google_access_token";
+    private static final String KEY_GOOGLE_REFRESH_TOKEN = "google_refresh_token";
+    private static final String KEY_GOOGLE_TOKEN_EXPIRY = "google_token_expiry";
+    private static final String KEY_STREAMER_LIVE_CHAT_ID = "streamer_live_chat_id";
+    private static final String KEY_STREAMER_VIDEO_ID = "streamer_video_id";
 
     private static final String DEF_TK_BASE =
             "https://thekarly.su/wp-content/plugins/tkcore/easyapi.php";
     private static final String DEF_MODE = "0";
-    private static final String DEF_VERSION = "2.0";
+    // TKCore keys without elevated permissions reject version 2.0 with "Insufficient permissions".
+    // Version 1.0 is the shape used by the original PHP panel, so it is the safe default.
+    private static final String DEF_VERSION = "1.0";
     private static final String DEF_INNERTUBE_KEY =
             "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
     private static final String DEF_CLIENT_VERSION = "2.20250312.04.00";
+    private static final String DEF_USER_MODE = "viewer";
+    private static final String YT_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl";
+    private static final String GOOGLE_DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code";
+    private static final String GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+    private static final String YT_API_BASE = "https://www.googleapis.com/youtube/v3";
 
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2);
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final Map<String, String> CHAT_CONTINUATIONS = new HashMap<>();
     private static final Map<String, String> COMMENT_CONTINUATIONS = new HashMap<>();
     private static final Map<String, Verdict> VERDICTS = new LinkedHashMap<>();
+    private static final Map<String, Boolean> DELETED_MESSAGES = new LinkedHashMap<>();
 
     private static Method addButtonMethod;
     private static WebView activeWeb;
     private static volatile String currentVideoId = "";
     private static Context appContext;
+    private static volatile String workingVersion = "";
 
     private TkProtect() {
     }
@@ -280,14 +300,12 @@ public final class TkProtect {
             int pad = dp(activity, 20);
             box.setPadding(pad, dp(activity, 8), pad, 0);
 
+            final Spinner userModeInput = modeField(activity, box, pref(activity, KEY_USER_MODE, DEF_USER_MODE));
+
             final EditText keyInput = field(activity, box, "TKCore API key", pref(activity, KEY_API_KEY, ""));
             final EditText baseInput = field(activity, box, "TKCore URL", pref(activity, KEY_TK_BASE, DEF_TK_BASE));
             final EditText modeInput = field(activity, box, "Режим (phrase2)", pref(activity, KEY_MODE, DEF_MODE));
-            final EditText versionInput = field(activity, box, "Версия API", pref(activity, KEY_VERSION, DEF_VERSION));
-            final EditText innertubeInput =
-                    field(activity, box, "YouTube API key", pref(activity, KEY_INNERTUBE_KEY, DEF_INNERTUBE_KEY));
-            final EditText clientInput =
-                    field(activity, box, "Версия клиента YouTube", pref(activity, KEY_CLIENT_VERSION, DEF_CLIENT_VERSION));
+            final Spinner versionInput = versionField(activity, box, pref(activity, KEY_VERSION, DEF_VERSION));
 
             TextView hint = new TextView(activity);
             String savedKey = pref(activity, KEY_API_KEY, "");
@@ -299,12 +317,13 @@ public final class TkProtect {
             box.addView(hint);
 
             TextView note = new TextView(activity);
-            note.setText("Ключ из web/config.php патчем НЕ используется — скопируйте тот же ключ сюда.");
+            note.setText("Ключ из web/config.php патчем НЕ используется — скопируйте тот же ключ сюда. "
+                    + "Обычно подходит 1.0. «Авто» пробует обе версии.");
             note.setPadding(0, dp(activity, 6), 0, 0);
             box.addView(note);
 
             Button testButton = new Button(activity);
-            testButton.setText("Проверить ключ");
+            testButton.setText("Проверить ключ TKCore");
             final TextView testResult = new TextView(activity);
             testResult.setPadding(0, dp(activity, 4), 0, dp(activity, 4));
             testButton.setOnClickListener(new View.OnClickListener() {
@@ -313,7 +332,7 @@ public final class TkProtect {
                     final String key = keyInput.getText().toString().trim();
                     final String base = baseInput.getText().toString().trim();
                     final String mode = modeInput.getText().toString().trim();
-                    final String version = versionInput.getText().toString().trim();
+                    final String version = selectedVersion(versionInput);
                     testResult.setText("Запрос к TKCore...");
                     EXECUTOR.execute(new Runnable() {
                         @Override
@@ -331,18 +350,149 @@ public final class TkProtect {
             });
             box.addView(testButton);
             box.addView(testResult);
+
+            // --- Streamer section ---
+            final LinearLayout streamerBox = new LinearLayout(activity);
+            streamerBox.setOrientation(LinearLayout.VERTICAL);
+            streamerBox.setPadding(0, dp(activity, 12), 0, 0);
+            TextView streamerTitle = new TextView(activity);
+            streamerTitle.setText("Режим стримера (YouTube API)");
+            streamerTitle.setPadding(0, dp(activity, 8), 0, 0);
+            streamerBox.addView(streamerTitle);
+
+            TextView streamerInfo = new TextView(activity);
+            streamerInfo.setText("Для авто-удаления нарушений из live-чата нужен OAuth-доступ: "
+                    + "создайте проект в Google Cloud Console, включите YouTube Data API v3, "
+                    + "создайте OAuth-клиент типа «TVs and Limited Input devices» и вставьте Client ID. "
+                    + "Токены хранятся только на этом устройстве.");
+            streamerInfo.setPadding(0, dp(activity, 4), 0, 0);
+            streamerBox.addView(streamerInfo);
+
+            final EditText googleClientIdInput = field(activity, streamerBox, "Google Client ID",
+                    pref(activity, KEY_GOOGLE_CLIENT_ID, ""));
+            final EditText googleClientSecretInput = field(activity, streamerBox,
+                    "Google Client Secret (если есть)", pref(activity, KEY_GOOGLE_CLIENT_SECRET, ""));
+            final TextView googleStatus = new TextView(activity);
+            googleStatus.setPadding(0, dp(activity, 6), 0, dp(activity, 4));
+            updateGoogleStatus(activity, googleStatus);
+            streamerBox.addView(googleStatus);
+
+            Button googleLoginButton = new Button(activity);
+            googleLoginButton.setText("Войти через Google (код)");
+            googleLoginButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    savePref(activity, KEY_GOOGLE_CLIENT_ID, googleClientIdInput.getText().toString().trim());
+                    savePref(activity, KEY_GOOGLE_CLIENT_SECRET, googleClientSecretInput.getText().toString().trim());
+                    startDeviceLogin(activity,
+                            googleClientIdInput.getText().toString().trim(),
+                            googleClientSecretInput.getText().toString().trim(),
+                            googleStatus);
+                }
+            });
+            streamerBox.addView(googleLoginButton);
+
+            Button googleLogoutButton = new Button(activity);
+            googleLogoutButton.setText("Выйти из Google (удалить токены)");
+            googleLogoutButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    clearGoogleTokens(activity);
+                    savePref(activity, KEY_STREAMER_LIVE_CHAT_ID, "");
+                    savePref(activity, KEY_STREAMER_VIDEO_ID, "");
+                    updateGoogleStatus(activity, googleStatus);
+                }
+            });
+            streamerBox.addView(googleLogoutButton);
+
+            Button findStreamButton = new Button(activity);
+            findStreamButton.setText("Найти мой активный стрим");
+            final TextView streamStatus = new TextView(activity);
+            streamStatus.setPadding(0, dp(activity, 4), 0, dp(activity, 4));
+            String boundChat = pref(activity, KEY_STREAMER_LIVE_CHAT_ID, "");
+            String boundVideo = pref(activity, KEY_STREAMER_VIDEO_ID, "");
+            streamStatus.setText(boundChat.isEmpty() ? "Активный стрим не привязан"
+                    : "Привязан liveChatId: " + boundChat + (boundVideo.isEmpty() ? "" : "\nvideoId: " + boundVideo));
+            findStreamButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    streamStatus.setText("Поиск активного стрима...");
+                    EXECUTOR.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                final String liveChatId = findActiveLiveChatId(activity);
+                                MAIN.post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        if (liveChatId.isEmpty()) {
+                                            streamStatus.setText("Активных стримов не найдено. "
+                                                    + "Запустите эфир и попробуйте снова.");
+                                        } else {
+                                            String vid = pref(activity, KEY_STREAMER_VIDEO_ID, "");
+                                            streamStatus.setText("Привязан liveChatId: " + liveChatId
+                                                    + (vid.isEmpty() ? "" : "\nvideoId: " + vid));
+                                        }
+                                        updateGoogleStatus(activity, googleStatus);
+                                    }
+                                });
+                            } catch (final Exception ex) {
+                                Log.w(TAG, "Find active stream failed", ex);
+                                MAIN.post(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        streamStatus.setText("Ошибка: " + ex.getMessage());
+                                    }
+                                });
+                            }
+                        }
+                    });
+                }
+            });
+            streamerBox.addView(findStreamButton);
+            streamerBox.addView(streamStatus);
+            box.addView(streamerBox);
+
+            final EditText innertubeInput =
+                    field(activity, box, "YouTube API key (Innertube)", pref(activity, KEY_INNERTUBE_KEY, DEF_INNERTUBE_KEY));
+            final EditText clientInput =
+                    field(activity, box, "Версия клиента YouTube", pref(activity, KEY_CLIENT_VERSION, DEF_CLIENT_VERSION));
+
             scroll.addView(box);
+
+            final Runnable toggleStreamer = new Runnable() {
+                @Override
+                public void run() {
+                    streamerBox.setVisibility(selectedUserMode(userModeInput).equals("streamer")
+                            ? View.VISIBLE : View.GONE);
+                }
+            };
+            toggleStreamer.run();
+            userModeInput.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+                @Override
+                public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                    toggleStreamer.run();
+                }
+
+                @Override
+                public void onNothingSelected(AdapterView<?> parent) {
+                }
+            });
 
             new AlertDialog.Builder(activity)
                     .setTitle("TKProtect — настройки")
                     .setView(scroll)
                     .setPositiveButton("Сохранить", (dialog, which) -> {
+                        savePref(activity, KEY_USER_MODE, selectedUserMode(userModeInput));
                         savePref(activity, KEY_API_KEY, keyInput.getText().toString().trim());
                         savePref(activity, KEY_TK_BASE, baseInput.getText().toString().trim());
                         savePref(activity, KEY_MODE, modeInput.getText().toString().trim());
-                        savePref(activity, KEY_VERSION, versionInput.getText().toString().trim());
+                        savePref(activity, KEY_VERSION, selectedVersion(versionInput));
+                        savePref(activity, KEY_GOOGLE_CLIENT_ID, googleClientIdInput.getText().toString().trim());
+                        savePref(activity, KEY_GOOGLE_CLIENT_SECRET, googleClientSecretInput.getText().toString().trim());
                         savePref(activity, KEY_INNERTUBE_KEY, innertubeInput.getText().toString().trim());
                         savePref(activity, KEY_CLIENT_VERSION, clientInput.getText().toString().trim());
+                        workingVersion = "";
                     })
                     .setNegativeButton("Отмена", null)
                     .show();
@@ -361,6 +511,74 @@ public final class TkProtect {
         input.setText(value);
         parent.addView(input);
         return input;
+    }
+
+    private static Spinner versionField(Context context, LinearLayout parent, String value) {
+        TextView text = new TextView(context);
+        text.setText("Версия API");
+        text.setPadding(0, dp(context, 10), 0, 0);
+        parent.addView(text);
+        Spinner spinner = new Spinner(context);
+        String[] labels = {"1.0 (рекомендуется)", "2.0", "Авто (подбор)"};
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(context,
+                android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+        int selected = 0;
+        if ("2.0".equals(value)) {
+            selected = 1;
+        } else if ("auto".equalsIgnoreCase(value)) {
+            selected = 2;
+        }
+        spinner.setSelection(selected);
+        parent.addView(spinner);
+        return spinner;
+    }
+
+    private static String selectedVersion(Spinner spinner) {
+        int position = spinner.getSelectedItemPosition();
+        if (position == 1) {
+            return "2.0";
+        }
+        if (position == 2) {
+            return "auto";
+        }
+        return "1.0";
+    }
+
+    private static Spinner modeField(Context context, LinearLayout parent, String value) {
+        TextView text = new TextView(context);
+        text.setText("Режим");
+        text.setPadding(0, dp(context, 10), 0, 0);
+        parent.addView(text);
+        Spinner spinner = new Spinner(context);
+        String[] labels = {"Зритель (локальное скрытие)", "Стример (авто-удаление через YouTube API)"};
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(context,
+                android.R.layout.simple_spinner_item, labels);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+        spinner.setSelection("streamer".equals(value) ? 1 : 0);
+        parent.addView(spinner);
+        return spinner;
+    }
+
+    private static String selectedUserMode(Spinner spinner) {
+        return spinner.getSelectedItemPosition() == 1 ? "streamer" : "viewer";
+    }
+
+    private static void updateGoogleStatus(Context context, TextView statusView) {
+        if (!hasGoogleTokens(context)) {
+            statusView.setText("Google: не авторизован");
+            statusView.setTextColor(0xFFFF6B6B);
+            return;
+        }
+        String chatId = pref(context, KEY_STREAMER_LIVE_CHAT_ID, "");
+        String base = "Google: авторизован";
+        if (!chatId.isEmpty()) {
+            base += " · liveChatId привязан";
+        }
+        statusView.setText(base);
+        statusView.setTextColor(0xFF7BD88F);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -386,6 +604,10 @@ public final class TkProtect {
                     out.put("ready", !key.isEmpty());
                     out.put("keyMask", maskKey(key));
                     out.put("keyLen", key.length());
+                    out.put("apiVersion", activeVersion(context));
+                    out.put("userMode", pref(context, KEY_USER_MODE, DEF_USER_MODE));
+                    out.put("streamerLinked", hasGoogleTokens(context));
+                    out.put("liveChatId", pref(context, KEY_STREAMER_LIVE_CHAT_ID, ""));
                     return out;
                 }
             });
@@ -445,6 +667,7 @@ public final class TkProtect {
                         Verdict verdict = verdictForText(context, text);
                         item.put("verdict", verdictJson(verdict));
                         item.put("hidden", verdict.bad);
+                        maybeAutoDeleteChatMessage(context, item, verdict);
                         outMessages.put(item);
                     }
                     JSONObject out = new JSONObject();
@@ -697,48 +920,129 @@ public final class TkProtect {
         return verdict;
     }
 
+    /**
+     * Checks text through TKCore. If the configured API version is rejected (for example because
+     * the key has no permission for 2.0), retry once with the other version and remember the one
+     * that works. This keeps old saved settings from silently disabling all hiding.
+     */
     private static Verdict checkText(Context context, String text) {
         String apiKey = pref(context, KEY_API_KEY, "");
         if (apiKey.isEmpty()) {
             return new Verdict("error", "Нет API key — откройте настройки", false);
         }
+        String configured = pref(context, KEY_VERSION, DEF_VERSION);
+        if ("auto".equalsIgnoreCase(configured) || configured.isEmpty()) {
+            configured = "1.0";
+        }
+        String preferred = workingVersion.isEmpty() ? configured : workingVersion;
+        Verdict verdict = checkTextVersioned(context, text, preferred, apiKey);
+        if (!"error".equals(verdict.type)) {
+            workingVersion = preferred;
+            return verdict;
+        }
+        if (preferred.equals(configured)) {
+            String alternate = "1.0".equals(configured) ? "2.0" : "1.0";
+            Verdict retry = checkTextVersioned(context, text, alternate, apiKey);
+            if (!"error".equals(retry.type)) {
+                workingVersion = alternate;
+                return retry;
+            }
+            return retry;
+        }
+        return verdict;
+    }
+
+    private static Verdict checkTextVersioned(Context context, String text, String version, String apiKey) {
         try {
             String base = pref(context, KEY_TK_BASE, DEF_TK_BASE);
             String query = "api_key=" + enc(apiKey)
                     + "&type=botmoderator"
                     + "&phrase=" + enc(text)
                     + "&phrase2=" + enc(pref(context, KEY_MODE, DEF_MODE))
-                    + "&version=" + enc(pref(context, KEY_VERSION, DEF_VERSION));
+                    + "&version=" + enc(version);
             HttpResponse response = request(base + "?" + query, "GET", null);
             JSONObject parsed = new JSONObject(response.body);
             String raw = parsed.has("type") ? String.valueOf(parsed.opt("type"))
                     : (parsed.has("error") ? "error" : "unknown");
-            return normalizeVerdict(raw);
+            Verdict verdict = normalizeVerdict(raw);
+            if ("error".equals(verdict.type) && parsed.has("error")) {
+                return new Verdict("error",
+                        "TKCore (version " + version + "): " + parsed.optString("error"), false);
+            }
+            return verdict;
         } catch (Exception ex) {
-            Log.w(TAG, "TKCore check failed", ex);
-            return new Verdict("error", "Ошибка проверки: " + ex.getMessage(), false);
+            Log.w(TAG, "TKCore check failed for version " + version, ex);
+            return new Verdict("error",
+                    "Ошибка проверки (version " + version + "): " + ex.getMessage(), false);
         }
     }
 
-    /** Sends a real request with the key currently typed into the settings dialog. */
+    /** The version that actually answers this key, for display in the panel. */
+    private static String activeVersion(Context context) {
+        if (!workingVersion.isEmpty()) {
+            return workingVersion;
+        }
+        String configured = pref(context, KEY_VERSION, DEF_VERSION);
+        if ("auto".equalsIgnoreCase(configured) || configured.isEmpty()) {
+            return "авто";
+        }
+        return configured;
+    }
+
+    /** Sends real requests with the key currently typed into the settings dialog. */
     private static String testKey(String key, String base, String mode, String version) {
         if (key == null || key.isEmpty()) {
             return "Ключ не введён — вставьте ключ в поле выше";
         }
+        String typed = version.isEmpty() ? DEF_VERSION : version;
+        if ("auto".equalsIgnoreCase(typed)) {
+            String v1 = requestKey(base, key, mode, "1.0");
+            String v2 = requestKey(base, key, mode, "2.0");
+            if (looksLikeVerdict(v1)) {
+                workingVersion = "1.0";
+            } else if (looksLikeVerdict(v2)) {
+                workingVersion = "2.0";
+            }
+            return "version 1.0: " + v1 + "\nversion 2.0: " + v2;
+        }
+        String first = requestKey(base, key, mode, typed);
+        if (looksLikeVerdict(first)) {
+            workingVersion = typed;
+            return "Ответ TKCore (version " + typed + "): " + first;
+        }
+        String alternate = "1.0".equals(typed) ? "2.0" : "1.0";
+        String second = requestKey(base, key, mode, alternate);
+        if (looksLikeVerdict(second)) {
+            workingVersion = alternate;
+        }
+        return "version " + typed + ": " + first + "\nversion " + alternate + ": " + second;
+    }
+
+    private static String requestKey(String base, String key, String mode, String version) {
         try {
             String url = (base.isEmpty() ? DEF_TK_BASE : base) + "?api_key=" + enc(key)
                     + "&type=botmoderator"
                     + "&phrase=" + enc("test")
                     + "&phrase2=" + enc(mode.isEmpty() ? DEF_MODE : mode)
-                    + "&version=" + enc(version.isEmpty() ? DEF_VERSION : version);
+                    + "&version=" + enc(version);
             HttpResponse response = request(url, "GET", null);
             String body = response.body == null ? "" : response.body;
             if (body.length() > 300) {
                 body = body.substring(0, 300) + "...";
             }
-            return "Ответ TKCore: " + body;
+            return body.isEmpty() ? "пустой ответ" : body;
         } catch (Exception ex) {
             return "Ошибка запроса: " + ex.getMessage();
+        }
+    }
+
+    private static boolean looksLikeVerdict(String body) {
+        try {
+            JSONObject parsed = new JSONObject(body);
+            String type = parsed.has("type") ? String.valueOf(parsed.opt("type")) : "";
+            return !type.isEmpty() && !"error".equals(type);
+        } catch (Exception ignored) {
+            return false;
         }
     }
 
@@ -1021,28 +1325,357 @@ public final class TkProtect {
     }
 
     // ---------------------------------------------------------------------------------------
+    // Streamer mode (Google OAuth device flow + YouTube Data API moderation)
+    // ---------------------------------------------------------------------------------------
+
+    private static boolean isStreamerMode(Context context) {
+        return "streamer".equals(pref(context, KEY_USER_MODE, DEF_USER_MODE));
+    }
+
+    private static boolean hasGoogleTokens(Context context) {
+        return !pref(context, KEY_GOOGLE_REFRESH_TOKEN, "").isEmpty()
+                || !pref(context, KEY_GOOGLE_ACCESS_TOKEN, "").isEmpty();
+    }
+
+    private static String googleClientId(Context context) {
+        return pref(context, KEY_GOOGLE_CLIENT_ID, "").trim();
+    }
+
+    private static String googleClientSecret(Context context) {
+        return pref(context, KEY_GOOGLE_CLIENT_SECRET, "").trim();
+    }
+
+    private static void clearGoogleTokens(Context context) {
+        savePref(context, KEY_GOOGLE_ACCESS_TOKEN, "");
+        savePref(context, KEY_GOOGLE_REFRESH_TOKEN, "");
+        savePref(context, KEY_GOOGLE_TOKEN_EXPIRY, "0");
+    }
+
+    private static String ensureGoogleAccessToken(Context context) throws Exception {
+        String access = pref(context, KEY_GOOGLE_ACCESS_TOKEN, "");
+        long expiry = 0;
+        try {
+            expiry = Long.parseLong(pref(context, KEY_GOOGLE_TOKEN_EXPIRY, "0"));
+        } catch (NumberFormatException ignored) {
+            expiry = 0;
+        }
+        if (!access.isEmpty() && System.currentTimeMillis() < expiry - 60000) {
+            return access;
+        }
+        String refresh = pref(context, KEY_GOOGLE_REFRESH_TOKEN, "");
+        if (refresh.isEmpty()) {
+            throw new IllegalStateException("Нет авторизации Google — войдите в настройках стримера");
+        }
+        String clientId = googleClientId(context);
+        if (clientId.isEmpty()) {
+            throw new IllegalStateException("Не указан Google Client ID");
+        }
+        String body = "client_id=" + enc(clientId)
+                + "&refresh_token=" + enc(refresh)
+                + "&grant_type=refresh_token";
+        String secret = googleClientSecret(context);
+        if (!secret.isEmpty()) {
+            body += "&client_secret=" + enc(secret);
+        }
+        HttpResponse response = requestRaw(GOOGLE_TOKEN_URL, "POST", body,
+                "application/x-www-form-urlencoded", null);
+        JSONObject json = new JSONObject(response.body);
+        if (response.code < 200 || response.code >= 400 || json.has("error")) {
+            String err = json.optString("error_description", json.optString("error", response.body));
+            throw new IllegalStateException("Не удалось обновить токен Google: " + err);
+        }
+        access = json.optString("access_token", "");
+        int expiresIn = json.optInt("expires_in", 3600);
+        if (access.isEmpty()) {
+            throw new IllegalStateException("Google не вернул access_token");
+        }
+        savePref(context, KEY_GOOGLE_ACCESS_TOKEN, access);
+        savePref(context, KEY_GOOGLE_TOKEN_EXPIRY,
+                String.valueOf(System.currentTimeMillis() + (long) expiresIn * 1000L));
+        if (json.has("refresh_token")) {
+            savePref(context, KEY_GOOGLE_REFRESH_TOKEN, json.optString("refresh_token", refresh));
+        }
+        return access;
+    }
+
+    private static void startDeviceLogin(final Activity activity, final String clientId,
+                                         final String clientSecret, final TextView statusView) {
+        if (clientId.isEmpty()) {
+            statusView.setText("Укажите Google Client ID");
+            return;
+        }
+        statusView.setText("Запрос кода авторизации...");
+        EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    String body = "client_id=" + enc(clientId) + "&scope=" + enc(YT_SCOPE);
+                    if (!clientSecret.isEmpty()) {
+                        body += "&client_secret=" + enc(clientSecret);
+                    }
+                    HttpResponse response = requestRaw(GOOGLE_DEVICE_CODE_URL, "POST", body,
+                            "application/x-www-form-urlencoded", null);
+                    final JSONObject json = new JSONObject(response.body);
+                    if (response.code < 200 || response.code >= 400 || json.has("error")) {
+                        final String err = json.optString("error_description",
+                                json.optString("error", response.body));
+                        MAIN.post(new Runnable() {
+                            @Override public void run() {
+                                statusView.setText("Ошибка авторизации: " + err);
+                            }
+                        });
+                        return;
+                    }
+                    final String deviceCode = json.optString("device_code", "");
+                    final String userCode = json.optString("user_code", "");
+                    final String verifyUrl = json.optString("verification_url",
+                            json.optString("verification_uri", "https://www.google.com/device"));
+                    int interval = json.optInt("interval", 5);
+                    int expiresIn = json.optInt("expires_in", 1800);
+                    MAIN.post(new Runnable() {
+                        @Override public void run() {
+                            statusView.setText("Код: " + userCode + "\nОткройте: " + verifyUrl
+                                    + "\nОжидание подтверждения...");
+                            new AlertDialog.Builder(activity)
+                                    .setTitle("Вход Google для стримера")
+                                    .setMessage("1) Откройте: " + verifyUrl
+                                            + "\n2) Введите код: " + userCode
+                                            + "\n\nПосле подтверждения окно настроек покажет статус.")
+                                    .setPositiveButton("OK", null)
+                                    .show();
+                        }
+                    });
+                    pollDeviceToken(activity, clientId, clientSecret, deviceCode, interval, expiresIn, statusView);
+                } catch (final Exception ex) {
+                    Log.w(TAG, "Device login start failed", ex);
+                    MAIN.post(new Runnable() {
+                        @Override public void run() {
+                            statusView.setText("Ошибка: " + ex.getMessage());
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    private static void pollDeviceToken(Activity activity, String clientId, String clientSecret,
+                                        String deviceCode, int intervalSec, int expiresIn,
+                                        final TextView statusView) {
+        long deadline = System.currentTimeMillis() + (long) expiresIn * 1000L;
+        int interval = Math.max(intervalSec, 5);
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                Thread.sleep((long) interval * 1000L);
+            } catch (InterruptedException ex) {
+                return;
+            }
+            try {
+                String body = "client_id=" + enc(clientId)
+                        + "&device_code=" + enc(deviceCode)
+                        + "&grant_type=urn:ietf:params:oauth:grant-type:device_code";
+                if (!clientSecret.isEmpty()) {
+                    body += "&client_secret=" + enc(clientSecret);
+                }
+                HttpResponse response = requestRaw(GOOGLE_TOKEN_URL, "POST", body,
+                        "application/x-www-form-urlencoded", null);
+                JSONObject json = new JSONObject(response.body);
+                if (response.code >= 200 && response.code < 300 && json.has("access_token")) {
+                    String access = json.optString("access_token", "");
+                    String refresh = json.optString("refresh_token", "");
+                    int tokenExpires = json.optInt("expires_in", 3600);
+                    Context ctx = activity.getApplicationContext();
+                    savePref(ctx, KEY_GOOGLE_CLIENT_ID, clientId);
+                    savePref(ctx, KEY_GOOGLE_CLIENT_SECRET, clientSecret);
+                    savePref(ctx, KEY_GOOGLE_ACCESS_TOKEN, access);
+                    if (!refresh.isEmpty()) {
+                        savePref(ctx, KEY_GOOGLE_REFRESH_TOKEN, refresh);
+                    }
+                    savePref(ctx, KEY_GOOGLE_TOKEN_EXPIRY,
+                            String.valueOf(System.currentTimeMillis() + (long) tokenExpires * 1000L));
+                    MAIN.post(new Runnable() {
+                        @Override public void run() {
+                            statusView.setText("Google авторизация выполнена. Теперь можно найти активный стрим.");
+                        }
+                    });
+                    return;
+                }
+                String error = json.optString("error", "");
+                if ("authorization_pending".equals(error)) {
+                    continue;
+                } else if ("slow_down".equals(error)) {
+                    interval += 5;
+                    continue;
+                } else if ("access_denied".equals(error) || "expired_token".equals(error)) {
+                    final String msg = json.optString("error_description", error);
+                    MAIN.post(new Runnable() {
+                        @Override public void run() {
+                            statusView.setText("Авторизация не завершена: " + msg);
+                        }
+                    });
+                    return;
+                } else if (!error.isEmpty()) {
+                    final String msg = json.optString("error_description", error);
+                    MAIN.post(new Runnable() {
+                        @Override public void run() {
+                            statusView.setText("Ошибка авторизации: " + msg);
+                        }
+                    });
+                    return;
+                }
+            } catch (Exception ex) {
+                Log.w(TAG, "Device token poll error", ex);
+            }
+        }
+        MAIN.post(new Runnable() {
+            @Override public void run() {
+                statusView.setText("Время ожидания авторизации истекло. Попробуйте снова.");
+            }
+        });
+    }
+
+    private static String findActiveLiveChatId(Context context) throws Exception {
+        String token = ensureGoogleAccessToken(context);
+        String url = YT_API_BASE + "/liveBroadcasts?part=snippet,status&broadcastStatus=active&mine=true&maxResults=5";
+        HttpResponse response = requestRaw(url, "GET", null, null, "Bearer " + token);
+        if (response.code == 401) {
+            savePref(context, KEY_GOOGLE_ACCESS_TOKEN, "");
+            token = ensureGoogleAccessToken(context);
+            response = requestRaw(url, "GET", null, null, "Bearer " + token);
+        }
+        JSONObject json = new JSONObject(response.body);
+        if (response.code < 200 || response.code >= 400) {
+            String err = json.optJSONObject("error") != null
+                    ? json.optJSONObject("error").optString("message", response.body)
+                    : response.body;
+            throw new IllegalStateException("YouTube API: " + err);
+        }
+        JSONArray items = json.optJSONArray("items");
+        if (items == null || items.length() == 0) {
+            return "";
+        }
+        for (int i = 0; i < items.length(); i++) {
+            JSONObject item = items.optJSONObject(i);
+            if (item == null) continue;
+            JSONObject snippet = item.optJSONObject("snippet");
+            if (snippet != null) {
+                String liveChatId = snippet.optString("liveChatId", "");
+                String videoId = item.optString("id", snippet.optString("videoId", ""));
+                if (!liveChatId.isEmpty()) {
+                    savePref(context, KEY_STREAMER_LIVE_CHAT_ID, liveChatId);
+                    if (!videoId.isEmpty()) {
+                        savePref(context, KEY_STREAMER_VIDEO_ID, videoId);
+                    }
+                    return liveChatId;
+                }
+            }
+        }
+        return "";
+    }
+
+    private static void maybeAutoDeleteChatMessage(Context context, JSONObject item, Verdict verdict) {
+        if (!verdict.bad) {
+            return;
+        }
+        if (!isStreamerMode(context)) {
+            return;
+        }
+        if (!hasGoogleTokens(context)) {
+            return;
+        }
+        String messageId = item.optString("id", "");
+        if (messageId.isEmpty() || DELETED_MESSAGES.containsKey(messageId)) {
+            return;
+        }
+        try {
+            String token = ensureGoogleAccessToken(context);
+            String url = YT_API_BASE + "/liveChat/messages?id=" + enc(messageId);
+            HttpResponse response = requestRaw(url, "DELETE", null, null, "Bearer " + token);
+            if (response.code == 204 || response.code == 200) {
+                item.put("deletedByStreamer", true);
+                rememberDeleted(messageId);
+            } else if (response.code == 401) {
+                savePref(context, KEY_GOOGLE_ACCESS_TOKEN, "");
+                token = ensureGoogleAccessToken(context);
+                response = requestRaw(url, "DELETE", null, null, "Bearer " + token);
+                if (response.code == 204 || response.code == 200) {
+                    item.put("deletedByStreamer", true);
+                    rememberDeleted(messageId);
+                } else {
+                    item.put("deleteError", "HTTP " + response.code);
+                    Log.w(TAG, "Delete failed after refresh: " + response.code + " " + response.body);
+                }
+            } else if (response.code == 404 || response.code == 403) {
+                // not found/already gone/not allowed for this message - don't retry forever
+                item.put("deleteError", "HTTP " + response.code);
+                rememberDeleted(messageId);
+                Log.w(TAG, "Delete not applicable: " + response.code + " " + response.body);
+            } else {
+                item.put("deleteError", "HTTP " + response.code);
+                Log.w(TAG, "Delete failed: " + response.code + " " + response.body);
+            }
+        } catch (Exception ex) {
+            try {
+                item.put("deleteError", String.valueOf(ex.getMessage()));
+            } catch (Exception ignored) {
+                // ignored
+            }
+            Log.w(TAG, "Auto-delete failed for " + messageId, ex);
+        }
+    }
+
+    private static void rememberDeleted(String messageId) {
+        if (DELETED_MESSAGES.size() > 500) {
+            Iterator<Map.Entry<String, Boolean>> it = DELETED_MESSAGES.entrySet().iterator();
+            int removed = 0;
+            while (it.hasNext() && removed < 200) {
+                it.next();
+                it.remove();
+                removed++;
+            }
+        }
+        DELETED_MESSAGES.put(messageId, true);
+    }
+
+    // ---------------------------------------------------------------------------------------
     // HTTP and preferences
     // ---------------------------------------------------------------------------------------
 
     private static final class HttpResponse {
+        final int code;
         final String body;
 
-        HttpResponse(String body) {
-            this.body = body;
+        HttpResponse(int code, String body) {
+            this.code = code;
+            this.body = body == null ? "" : body;
         }
     }
 
     private static HttpResponse request(String url, String method, String body) throws Exception {
+        HttpResponse response = requestRaw(url, method, body,
+                body == null ? null : "application/json; charset=utf-8", null);
+        if (response.code < 200 || response.code >= 400) {
+            throw new IllegalStateException("HTTP " + response.code + ": " + response.body);
+        }
+        return response;
+    }
+
+    private static HttpResponse requestRaw(String url, String method, String body,
+                                           String contentType, String authorization) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(url).openConnection();
         try {
             connection.setRequestMethod(method);
             connection.setConnectTimeout(20000);
             connection.setReadTimeout(20000);
-            connection.setDoOutput(body != null);
             connection.setRequestProperty("User-Agent", "TKProtect/1.0");
             connection.setRequestProperty("Accept", "application/json");
+            if (authorization != null && !authorization.isEmpty()) {
+                connection.setRequestProperty("Authorization", authorization);
+            }
             if (body != null) {
-                connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+                connection.setDoOutput(true);
+                if (contentType != null && !contentType.isEmpty()) {
+                    connection.setRequestProperty("Content-Type", contentType);
+                }
                 OutputStream stream = connection.getOutputStream();
                 try {
                     stream.write(body.getBytes(StandardCharsets.UTF_8));
@@ -1053,7 +1686,7 @@ public final class TkProtect {
             int code = connection.getResponseCode();
             InputStream stream = code >= 400 ? connection.getErrorStream() : connection.getInputStream();
             if (stream == null) {
-                return new HttpResponse("");
+                return new HttpResponse(code, "");
             }
             ByteArrayOutputStream out = new ByteArrayOutputStream();
             byte[] buffer = new byte[8192];
@@ -1062,10 +1695,7 @@ public final class TkProtect {
                 out.write(buffer, 0, read);
             }
             stream.close();
-            if (code < 200 || code >= 400) {
-                throw new IllegalStateException("HTTP " + code + ": " + out.toString("UTF-8"));
-            }
-            return new HttpResponse(out.toString("UTF-8"));
+            return new HttpResponse(code, out.toString("UTF-8"));
         } finally {
             connection.disconnect();
         }
@@ -1161,20 +1791,21 @@ public final class TkProtect {
                 "function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;')",
                 ".replace(/>/g,'&gt;').replace(/\"/g,'&quot;')}",
                 "function render(list,el,hide){if(!list.length){el.innerHTML='<p class=empty>Пусто.</p>';return}",
-                "el.innerHTML=list.map(x=>{const off=x.hidden&&!hide;",
+                "el.innerHTML=list.map(x=>{const off=x.hidden&&!hide;const extra=x.deletedByStreamer?' · удалено из чата (YouTube)':(x.deleteError?' · ошибка удаления':'');",
                 "return '<div class=\"item'+(off?' hidden':'')+'\"><div class=meta><b>'+esc(x.author||'Аноним')+'</b>',",
                 "+(x.publishedAt?'<span>'+esc(x.publishedAt)+'</span>':'')+'</div><div class=text'+(off?' masked':'')+'>'",
                 "+(off?'Скрыто TKProtect':esc(x.text))+'</div>'+(x.verdict&&!off&&x.verdict.bad?",
-                "'<div class=bad>'+esc(x.verdict.label)+'</div>':'')+'</div>'}).join('')}",
+                "'<div class=bad>'+esc(x.verdict.label+extra)+'</div>':(extra?'<div class=bad>'+esc(extra.slice(3))+'</div>':''))+'</div>'}).join('')}",
                 "function refresh(){render(chat,$('chat'),$('force').checked);",
                 "render(comments,$('comments'),$('force').checked);",
                 "$('nChecked').textContent=chat.length+comments.length;",
                 "$('nHidden').textContent=chat.filter(x=>x.hidden).length+comments.filter(x=>x.hidden).length}",
                 "function merge(old,next){const seen=new Set(old.map(x=>x.id).filter(Boolean));",
                 "return old.concat(next.filter(x=>{if(x.id&&seen.has(x.id))return false;if(x.id)seen.add(x.id);return true})).slice(-300)}",
-                "window.tkpOnBootstrap=d=>{ready=!!d.ready;const k=d.keyMask?(' · ключ '+d.keyMask):'';",
-                "$('status').textContent=ready?('TKProtect активен'+k):'TKCore ключ не сохранён (длина '+(d.keyLen||0)+') — долгий тап по TK, вставьте ключ и нажмите «Сохранить»';",
-                "log(ready?('Готово'+k):'Ключ не сохранён')}",
+                "window.tkpOnBootstrap=d=>{ready=!!d.ready;const k=d.keyMask?(' · ключ '+d.keyMask):'';const v=d.apiVersion?(' · API '+d.apiVersion):'';",
+                "const m=d.userMode==='streamer'?(d.streamerLinked?' · Стример: авто-удаление':' · Стример: Google не привязан'):' · Зритель';",
+                "$('status').textContent=ready?('TKProtect активен'+k+v+m):'TKCore ключ не сохранён (длина '+(d.keyLen||0)+') — долгий тап по TK, вставьте ключ и нажмите «Сохранить»';",
+                "log(ready?('Готово'+k+v+m):'Ключ не сохранён')}",
                 "window.tkpOnCheck=d=>{$('checkResult').className=d.bad?'bad':'muted';",
                 "$('checkResult').textContent=(d.label||d.type||'')+(d.error?' — '+d.error:'')}",
                 "window.tkpOnVideo=d=>{const v=d.video||'';if(!/^[A-Za-z0-9_-]{11}$/.test(v))return;",

@@ -574,7 +574,7 @@ public final class TkProtect {
         Iterator<String> extraKeys = extra.keys();
         while (extraKeys.hasNext()) {
             String key = extraKeys.next();
-            body.put(key, extra.get(key));
+            body.put(key, extra.opt(key));
         }
         String key = pref(context, KEY_INNERTUBE_KEY, DEF_INNERTUBE_KEY);
         String url = "https://www.youtube.com/youtubei/v1/" + endpoint
@@ -595,7 +595,7 @@ public final class TkProtect {
                 Iterator<String> names = object.keys();
                 while (names.hasNext()) {
                     String name = names.next();
-                    Object value = object.get(name);
+                    Object value = object.opt(name);
                     if (key.equals(name)) {
                         found.add(value);
                     }

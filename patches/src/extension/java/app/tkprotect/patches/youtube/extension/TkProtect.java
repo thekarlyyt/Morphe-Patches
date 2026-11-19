@@ -921,6 +921,9 @@ public final class TkProtect {
             case "phishing":
                 return "Фишинговая ссылка";
             case "caps_flood":
+            case "caps":
+            case "flood":
+            case "spam":
                 return "Капс / флуд";
             case "scam":
                 return "Скам";
@@ -930,6 +933,8 @@ public final class TkProtect {
                 return "Персональные данные";
             case "error":
                 return "Ошибка проверки";
+            case "pending":
+                return "Ещё не проверено";
             default:
                 return "Неизвестный ответ: " + type;
         }
@@ -937,42 +942,44 @@ public final class TkProtect {
 
     private static boolean isBadVerdict(String type) {
         return !("allowed".equals(type) || "whitelist".equals(type) || "scanner".equals(type)
-                || "error".equals(type) || "unknown".equals(type));
+                || "error".equals(type) || "unknown".equals(type) || "pending".equals(type));
     }
 
     private static Verdict normalizeVerdict(String raw) {
-        String type;
-        switch (raw) {
+        String type = raw == null ? "unknown" : raw.trim();
+        if (type.isEmpty()) {
+            type = "unknown";
+        }
+        // Numeric verdict codes (may arrive as "3" or "3.0").
+        String numeric = type;
+        if (numeric.endsWith(".0")) {
+            numeric = numeric.substring(0, numeric.length() - 2);
+        }
+        switch (numeric) {
             case "-1":
-            case "error":
                 type = "error";
                 break;
             case "0":
-            case "allowed":
                 type = "allowed";
                 break;
             case "1":
-            case "obscene":
                 type = "obscene";
                 break;
             case "2":
-            case "phishing":
                 type = "phishing";
                 break;
             case "3":
-            case "caps_flood":
                 type = "caps_flood";
                 break;
             case "4":
-            case "pii":
                 type = "pii";
                 break;
             case "5":
-            case "scam":
                 type = "scam";
                 break;
             default:
-                type = "unknown";
+                // Keep named types as-is (e.g. blacklist, whitelist, scanner, pending, caps_flood).
+                type = type;
                 break;
         }
         return new Verdict(type, verdictLabel(type), isBadVerdict(type));

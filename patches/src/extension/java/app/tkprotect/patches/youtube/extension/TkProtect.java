@@ -117,7 +117,10 @@ public final class TkProtect {
     private static final Map<String, String> COMMENT_CONTINUATIONS = new HashMap<>();
     private static final Map<String, CommentsState> COMMENT_STATES = new HashMap<>();
     private static final Map<String, Verdict> VERDICTS = new LinkedHashMap<>();
+    private static final Map<String, Long> FAILED_UNTIL = new HashMap<>();
     private static final Map<String, Boolean> DELETED_MESSAGES = new LinkedHashMap<>();
+    private static final long FAILED_TTL_MS = 30_000L;
+    private static final int MAX_VERDICTS = 2000;
 
     private static Method addButtonMethod;
     private static WebView activeWeb;
@@ -965,6 +968,8 @@ public final class TkProtect {
                 return "Ошибка проверки";
             case "pending":
                 return "Ещё не проверено";
+            case "unknown":
+                return "Неизвестный ответ (не скрываем)";
             default:
                 return "Неизвестный ответ: " + type;
         }
@@ -977,7 +982,10 @@ public final class TkProtect {
 
     private static Verdict normalizeVerdict(String raw) {
         String type = raw == null ? "unknown" : raw.trim();
-        if (type.isEmpty()) {
+        // A malformed reply must never turn into a "bad" verdict: that would hide a normal
+        // comment and print NaN/undefined in the panel. Fail open instead.
+        if (type.isEmpty() || "NaN".equalsIgnoreCase(type) || "null".equalsIgnoreCase(type)
+                || "undefined".equalsIgnoreCase(type) || type.contains("NaN")) {
             type = "unknown";
         }
         // Numeric verdict codes (may arrive as "3" or "3.0").
@@ -1036,17 +1044,44 @@ public final class TkProtect {
             if (cached != null) {
                 return cached;
             }
+            // Network/parse failures are fail-open (not hidden). Remember them briefly so the
+            // same message is not re-checked on every 5s poll while the request is unstable.
+            Long until = FAILED_UNTIL.get(key);
+            if (until != null) {
+                if (until > System.currentTimeMillis()) {
+                    return new Verdict("error", "Ошибка проверки (ожидание повтора)", false);
+                }
+                FAILED_UNTIL.remove(key);
+            }
         } catch (Exception ignored) {
             // ignored
         }
         Verdict verdict = checkText(context, text);
-        if (key != null && verdict != null && !"error".equals(verdict.type)) {
-            if (VERDICTS.size() > 300) {
-                VERDICTS.clear();
+        if (key != null && verdict != null) {
+            if (!"error".equals(verdict.type)) {
+                rememberVerdict(key, verdict);
+                FAILED_UNTIL.remove(key);
+            } else {
+                FAILED_UNTIL.put(key, System.currentTimeMillis() + FAILED_TTL_MS);
+                if (FAILED_UNTIL.size() > 400) {
+                    FAILED_UNTIL.clear();
+                }
             }
-            VERDICTS.put(key, verdict);
         }
         return verdict;
+    }
+
+    private static void rememberVerdict(String key, Verdict verdict) {
+        if (VERDICTS.size() >= MAX_VERDICTS) {
+            Iterator<String> it = VERDICTS.keySet().iterator();
+            int removed = 0;
+            while (it.hasNext() && removed < 200) {
+                it.next();
+                it.remove();
+                removed++;
+            }
+        }
+        VERDICTS.put(key, verdict);
     }
 
     /**
@@ -2475,20 +2510,25 @@ public final class TkProtect {
                 ".replace(/>/g,'&gt;').replace(/\"/g,'&quot;')}",
                 "function escJs(s){return String(s==null?'':s).replace(/\\\\/g,'\\\\\\\\').replace(/'/g,\"\\\\'\")}",
                 "function mod(id,ch){log('Модерация: '+id);TK.moderate(id,ch||'')}",
+                "function safe(v){if(v==null)return '';if(typeof v==='number'&&!isFinite(v))return '';",
+                "var s=String(v).replace(/NaN|undefined/g,'');return s==='null'?'':s}",
                 "function render(list,el,hide){if(!list.length){el.innerHTML='<p class=empty>Пусто.</p>';return}",
-                "el.innerHTML=list.map(x=>{const off=x.hidden&&!hide;const extra=x.deletedByStreamer?' · удалено из чата (YouTube)':(x.bannedByStreamer?' · нарушитель заблокирован':'')+(x.deleteError?' · ошибка удаления':'')+(x.banError?' · ошибка бана':'');",
-                "const canMod=userMode==='streamer'&&streamerLinked&&streamerAction==='manual'&&x.verdict&&x.verdict.bad&&x.actionPending&&!x.deletedByStreamer&&x.id;",
-                "const btn=canMod?'<div><button onclick=\"mod(\\''+escJs(x.id)+'\\',\\''+escJs(x.channelId||'')+'\\')\">Удалить'+(x.channelId?' / применить бан':'')+'</button></div>':'';",
-                "return '<div class=\"item'+(off?' hidden':'')+'\"><div class=meta><b>'+esc(x.author||'Аноним')+'</b>',",
-                "+(x.publishedAt?'<span>'+esc(x.publishedAt)+'</span>':'')+'</div><div class=text'+(off?' masked':'')+'>'",
-                "+(off?'Скрыто TKProtect':esc(x.text))+'</div>'+(x.verdict&&x.verdict.bad?",
-                "'<div class=bad>'+esc(x.verdict.label+extra)+'</div>':(extra?'<div class=bad>'+esc(extra.replace(/^ · /,''))+'</div>':''))+btn+'</div>'}).join('')}",
+                "el.innerHTML=list.map(x=>{var off=!!x.hidden&&!hide;",
+                "var reason=safe(x.verdict&&x.verdict.label);var author=safe(x.author)||'Аноним';var date=safe(x.publishedAt);",
+                "var body=off?'Скрыто TKProtect':safe(x.text);",
+                "var extra=x.deletedByStreamer?'удалено из чата (YouTube)':(x.bannedByStreamer?'нарушитель заблокирован':'')+(x.deleteError?'ошибка удаления':'')+(x.banError?'ошибка бана':'');",
+                "var canMod=userMode==='streamer'&&streamerLinked&&streamerAction==='manual'&&x.verdict&&x.verdict.bad&&x.actionPending&&!x.deletedByStreamer&&x.id;",
+                "var btn=canMod?'<div><button onclick=\"mod(\\''+escJs(safe(x.id))+'\\',\\''+escJs(safe(x.channelId))+'\\')\">Удалить'+(x.channelId?' / применить бан':'')+'</button></div>':'';",
+                "var tail=reason||safe(extra);",
+                "return '<div class=\"item'+(off?' hidden':'')+'\"><div class=meta><b>'+esc(author)+'</b>'+(date?'<span>'+esc(date)+'</span>':'')+'</div>'+",
+                "'<div class=text'+(off?' masked':'')+'>'+esc(body)+'</div>'+(tail?'<div class=bad>'+esc(tail)+'</div>':'')+btn+'</div>'}).join('')}",
                 "function refresh(){render(chat,$('chat'),$('force').checked);",
                 "render(comments,$('comments'),$('force').checked);",
                 "$('nChecked').textContent=chat.length+comments.length;",
                 "$('nHidden').textContent=chat.filter(x=>x.hidden).length+comments.filter(x=>x.hidden).length}",
                 "function merge(old,next){const seen=new Set(old.map(x=>x.id).filter(Boolean));",
-                "return old.concat(next.filter(x=>{if(x.id&&seen.has(x.id))return false;if(x.id)seen.add(x.id);return true})).slice(-300)}",
+                "const deduped=next.filter(x=>{if(x.id&&seen.has(x.id))return false;if(x.id)seen.add(x.id);return true});",
+                "return deduped.length?old.concat(deduped).slice(-300):old}",
                 "function applyStatus(d){if(!d)return; if(d.ready===undefined){if(d.error){$('status').textContent='Ошибка: '+d.error;log('Ошибка: '+d.error)} return;} ready=!!d.ready;if(d.streamerAction)streamerAction=d.streamerAction;if(d.userMode)userMode=d.userMode;streamerLinked=!!d.streamerLinked;",
                 "const k=d.keyMask?(' · ключ '+d.keyMask):'';const v=d.apiVersion?(' · API '+d.apiVersion):'';",
                 "const act=streamerAction==='manual'?'ручное подтверждение':'авто-удаление';",
@@ -2518,14 +2558,14 @@ public final class TkProtect {
                 "refresh();log('Подключено к '+v);TK.bootstrap();poll(true)}",
                 "$('video').onkeydown=e=>{if(e.key==='Enter')$('connect').click()}",
                 "function switchTab(n){tab=n;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x.dataset.tab===n));",
-                "['chat','comments','tool'].forEach(x=>$('view-'+x).hidden=(x!==n));poll(false)}",
+                "['chat','comments','tool'].forEach(x=>$('view-'+x).hidden=(x!==n));if(n==='comments'){if(!comments.length)poll(true)}else poll(false)}",
                 "document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab))",
                 "$('checkBtn').onclick=()=>{const t=$('check').value.trim();if(!t)return;",
                 "$('checkResult').textContent='Проверка...';TK.check(t)}",
                 "$('force').onchange=refresh;",
                 "function poll(reset){if(!videoId)return;if(tab==='chat')TK.chat(videoId,!!reset);",
-                "else if(tab==='comments')TK.comments(videoId,!!reset)}",
-                "setInterval(()=>{if(videoId&&!document.hidden)poll(false)},5000);",
+                "else if(tab==='comments'&&reset)TK.comments(videoId,true)}",
+                "setInterval(()=>{if(videoId&&!document.hidden&&tab==='chat')poll(false)},5000);",
                 "TK.bootstrap();",
                 "const autoId=TK.getVideoId()||'';",
                 "if(autoId){$('video').value=autoId;connect(autoId);log('ID видео взят из плеера')}",

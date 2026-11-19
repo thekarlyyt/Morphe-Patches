@@ -1,0 +1,5 @@
+<?php
+// Copy this file to config.local.php and fill in your own TKCore API key.
+return array(
+    'tk_api_key' => 'YOUR_TKCORE_API_KEY',
+);

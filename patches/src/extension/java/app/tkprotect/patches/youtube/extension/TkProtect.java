@@ -13,6 +13,7 @@ import android.view.View;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -86,6 +87,7 @@ public final class TkProtect {
     private static Method addButtonMethod;
     private static WebView activeWeb;
     private static volatile String currentVideoId = "";
+    private static Context appContext;
 
     private TkProtect() {
     }
@@ -193,6 +195,10 @@ public final class TkProtect {
 
     private static void onPlayerOverlayButtons(View sourceButton) {
         try {
+            Context buttonContext = sourceButton.getContext();
+            if (buttonContext != null && buttonContext.getApplicationContext() != null) {
+                appContext = buttonContext.getApplicationContext();
+            }
             if (addButtonMethod == null) {
                 addButtonMethod = Class.forName(PLAYER_OVERLAY_BUTTON).getMethod(
                         "addButtonWithTextOverlay",
@@ -286,11 +292,45 @@ public final class TkProtect {
             TextView hint = new TextView(activity);
             String savedKey = pref(activity, KEY_API_KEY, "");
             hint.setText(savedKey.isEmpty()
-                    ? "Ключ из web/config.php НЕ используется патчем. Вставьте ваш TKCore API key сюда."
-                    : "Сохранённый ключ: " + maskKey(savedKey)
-                            + " (ключ из web/config.php не используется).");
+                    ? "КЛЮЧ НЕ СОХРАНЁН. Вставьте ваш TKCore API key в поле выше и нажмите «Сохранить»."
+                    : "Ключ сохранён: " + maskKey(savedKey));
+            hint.setTextColor(savedKey.isEmpty() ? 0xFFFF6B6B : 0xFF7BD88F);
             hint.setPadding(0, dp(activity, 8), 0, 0);
             box.addView(hint);
+
+            TextView note = new TextView(activity);
+            note.setText("Ключ из web/config.php патчем НЕ используется — скопируйте тот же ключ сюда.");
+            note.setPadding(0, dp(activity, 6), 0, 0);
+            box.addView(note);
+
+            Button testButton = new Button(activity);
+            testButton.setText("Проверить ключ");
+            final TextView testResult = new TextView(activity);
+            testResult.setPadding(0, dp(activity, 4), 0, dp(activity, 4));
+            testButton.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View view) {
+                    final String key = keyInput.getText().toString().trim();
+                    final String base = baseInput.getText().toString().trim();
+                    final String mode = modeInput.getText().toString().trim();
+                    final String version = versionInput.getText().toString().trim();
+                    testResult.setText("Запрос к TKCore...");
+                    EXECUTOR.execute(new Runnable() {
+                        @Override
+                        public void run() {
+                            final String result = testKey(key, base, mode, version);
+                            MAIN.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    testResult.setText(result);
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+            box.addView(testButton);
+            box.addView(testResult);
             scroll.addView(box);
 
             new AlertDialog.Builder(activity)
@@ -345,6 +385,7 @@ public final class TkProtect {
                     String key = pref(context, KEY_API_KEY, "");
                     out.put("ready", !key.isEmpty());
                     out.put("keyMask", maskKey(key));
+                    out.put("keyLen", key.length());
                     return out;
                 }
             });
@@ -676,6 +717,28 @@ public final class TkProtect {
         } catch (Exception ex) {
             Log.w(TAG, "TKCore check failed", ex);
             return new Verdict("error", "Ошибка проверки: " + ex.getMessage(), false);
+        }
+    }
+
+    /** Sends a real request with the key currently typed into the settings dialog. */
+    private static String testKey(String key, String base, String mode, String version) {
+        if (key == null || key.isEmpty()) {
+            return "Ключ не введён — вставьте ключ в поле выше";
+        }
+        try {
+            String url = (base.isEmpty() ? DEF_TK_BASE : base) + "?api_key=" + enc(key)
+                    + "&type=botmoderator"
+                    + "&phrase=" + enc("test")
+                    + "&phrase2=" + enc(mode.isEmpty() ? DEF_MODE : mode)
+                    + "&version=" + enc(version.isEmpty() ? DEF_VERSION : version);
+            HttpResponse response = request(url, "GET", null);
+            String body = response.body == null ? "" : response.body;
+            if (body.length() > 300) {
+                body = body.substring(0, 300) + "...";
+            }
+            return "Ответ TKCore: " + body;
+        } catch (Exception ex) {
+            return "Ошибка запроса: " + ex.getMessage();
         }
     }
 
@@ -1012,14 +1075,18 @@ public final class TkProtect {
         return URLEncoder.encode(value, "UTF-8");
     }
 
+    private static Context storageContext(Context context) {
+        return appContext != null ? appContext : context.getApplicationContext();
+    }
+
     private static String pref(Context context, String key, String fallback) {
-        return context.getApplicationContext()
+        return storageContext(context)
                 .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .getString(key, fallback);
     }
 
     private static void savePref(Context context, String key, String value) {
-        context.getApplicationContext()
+        storageContext(context)
                 .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
                 .putString(key, value)
@@ -1106,8 +1173,8 @@ public final class TkProtect {
                 "function merge(old,next){const seen=new Set(old.map(x=>x.id).filter(Boolean));",
                 "return old.concat(next.filter(x=>{if(x.id&&seen.has(x.id))return false;if(x.id)seen.add(x.id);return true})).slice(-300)}",
                 "window.tkpOnBootstrap=d=>{ready=!!d.ready;const k=d.keyMask?(' · ключ '+d.keyMask):'';",
-                "$('status').textContent=ready?('TKProtect активен'+k):'Нет TKCore API key — долгий тап по TK для настроек';",
-                "log(ready?('Готово'+k):'Нет ключа')}",
+                "$('status').textContent=ready?('TKProtect активен'+k):'TKCore ключ не сохранён (длина '+(d.keyLen||0)+') — долгий тап по TK, вставьте ключ и нажмите «Сохранить»';",
+                "log(ready?('Готово'+k):'Ключ не сохранён')}",
                 "window.tkpOnCheck=d=>{$('checkResult').className=d.bad?'bad':'muted';",
                 "$('checkResult').textContent=(d.label||d.type||'')+(d.error?' — '+d.error:'')}",
                 "window.tkpOnVideo=d=>{const v=d.video||'';if(!/^[A-Za-z0-9_-]{11}$/.test(v))return;",
@@ -1121,7 +1188,7 @@ public final class TkProtect {
                 "$('connect').onclick=()=>connect($('video').value.trim());",
                 "function connect(v){if(!/^[A-Za-z0-9_-]{11}$/.test(v)){alert('Откройте видео или введите ID из 11 символов');return}",
                 "videoId=v;$('video').value=v;chat=[];comments=[];resetChat=true;resetComments=true;",
-                "refresh();log('Подключено к '+v);poll(true)}",
+                "refresh();log('Подключено к '+v);TK.bootstrap();poll(true)}",
                 "$('video').onkeydown=e=>{if(e.key==='Enter')$('connect').click()}",
                 "function switchTab(n){tab=n;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x.dataset.tab===n));",
                 "['chat','comments','tool'].forEach(x=>$('view-'+x).hidden=(x!==n));poll(false)}",

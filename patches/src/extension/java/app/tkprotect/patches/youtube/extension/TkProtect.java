@@ -271,21 +271,31 @@ public final class TkProtect {
             settings.setDomStorageEnabled(true);
             settings.setLoadWithOverviewMode(true);
             settings.setUseWideViewPort(true);
+            web.setFocusable(true);
+            web.setFocusableInTouchMode(true);
             web.setBackgroundColor(0xFF101317);
             web.addJavascriptInterface(new Bridge(activity, web), "TK");
             activeWeb = web;
 
-            new AlertDialog.Builder(activity)
+            AlertDialog dialog = new AlertDialog.Builder(activity)
                     .setTitle("TKProtect")
                     .setView(web)
                     .setPositiveButton("Закрыть", null)
-                    .setOnDismissListener(dialog -> {
+                    .setOnDismissListener(d -> {
                         if (activeWeb == web) {
                             activeWeb = null;
                         }
                         web.destroy();
                     })
-                    .show();
+                    .create();
+            dialog.show();
+            if (dialog.getWindow() != null) {
+                dialog.getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | android.view.WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM);
+                dialog.getWindow().setSoftInputMode(
+                        android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+            }
+            web.requestFocus();
 
             web.loadDataWithBaseURL(null, panelHtml(), "text/html", "UTF-8", null);
         } catch (RuntimeException ex) {
@@ -308,7 +318,6 @@ public final class TkProtect {
             final Spinner userModeInput = modeField(activity, box, pref(activity, KEY_USER_MODE, DEF_USER_MODE));
 
             final EditText keyInput = field(activity, box, "TKCore API key", pref(activity, KEY_API_KEY, ""));
-            final EditText baseInput = field(activity, box, "TKCore URL", pref(activity, KEY_TK_BASE, DEF_TK_BASE));
             final EditText modeInput = field(activity, box, "Режим (phrase2)", pref(activity, KEY_MODE, DEF_MODE));
             final Spinner versionInput = versionField(activity, box, pref(activity, KEY_VERSION, DEF_VERSION));
 
@@ -335,14 +344,18 @@ public final class TkProtect {
                 @Override
                 public void onClick(View view) {
                     final String key = keyInput.getText().toString().trim();
-                    final String base = baseInput.getText().toString().trim();
+                    String base = pref(activity, KEY_TK_BASE, DEF_TK_BASE);
+                    if (base == null || base.trim().isEmpty()) {
+                        base = DEF_TK_BASE;
+                    }
+                    final String resolvedBase = base;
                     final String mode = modeInput.getText().toString().trim();
                     final String version = selectedVersion(versionInput);
                     testResult.setText("Запрос к TKCore...");
                     EXECUTOR.execute(new Runnable() {
                         @Override
                         public void run() {
-                            final String result = testKey(key, base, mode, version);
+                            final String result = testKey(key, resolvedBase, mode, version);
                             MAIN.post(new Runnable() {
                                 @Override
                                 public void run() {
@@ -511,7 +524,6 @@ public final class TkProtect {
                     .setPositiveButton("Сохранить", (dialog, which) -> {
                         savePref(activity, KEY_USER_MODE, selectedUserMode(userModeInput));
                         savePref(activity, KEY_API_KEY, keyInput.getText().toString().trim());
-                        savePref(activity, KEY_TK_BASE, baseInput.getText().toString().trim());
                         savePref(activity, KEY_MODE, modeInput.getText().toString().trim());
                         savePref(activity, KEY_VERSION, selectedVersion(versionInput));
                         savePref(activity, KEY_GOOGLE_CLIENT_ID, googleClientIdInput.getText().toString().trim());
@@ -865,7 +877,7 @@ public final class TkProtect {
     private static void callJs(WebView web, String name, JSONObject payload) {
         try {
             web.evaluateJavascript(
-                    "if(window." + name + ")" + name + "(" + JSONObject.quote(payload.toString()) + ");",
+                    "if(window." + name + ")window." + name + "(JSON.parse(" + JSONObject.quote(payload.toString()) + "));",
                     null);
         } catch (RuntimeException ex) {
             Log.w(TAG, "Could not deliver JS callback", ex);
@@ -2022,7 +2034,7 @@ public final class TkProtect {
                 "$('nHidden').textContent=chat.filter(x=>x.hidden).length+comments.filter(x=>x.hidden).length}",
                 "function merge(old,next){const seen=new Set(old.map(x=>x.id).filter(Boolean));",
                 "return old.concat(next.filter(x=>{if(x.id&&seen.has(x.id))return false;if(x.id)seen.add(x.id);return true})).slice(-300)}",
-                "function applyStatus(d){if(!d||d.ready===undefined)return;ready=!!d.ready;if(d.streamerAction)streamerAction=d.streamerAction;if(d.userMode)userMode=d.userMode;streamerLinked=!!d.streamerLinked;",
+                "function applyStatus(d){if(!d)return; if(d.ready===undefined){if(d.error){$('status').textContent='Ошибка: '+d.error;log('Ошибка: '+d.error)} return;} ready=!!d.ready;if(d.streamerAction)streamerAction=d.streamerAction;if(d.userMode)userMode=d.userMode;streamerLinked=!!d.streamerLinked;",
                 "const k=d.keyMask?(' · ключ '+d.keyMask):'';const v=d.apiVersion?(' · API '+d.apiVersion):'';",
                 "const act=streamerAction==='manual'?'ручное подтверждение':'авто-удаление';",
                 "const m=userMode==='streamer'?(streamerLinked?' · Стример: '+act:' · Стример: Google не привязан'):' · Зритель';",

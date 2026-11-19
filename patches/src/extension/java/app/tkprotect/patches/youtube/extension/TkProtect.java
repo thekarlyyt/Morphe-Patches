@@ -58,6 +58,8 @@ public final class TkProtect {
     private static final String ADD_ON_API = "app.morphe.extension.youtube.addon.AddOnApi";
     private static final String PLAYER_OVERLAY_BUTTON =
             "app.morphe.extension.youtube.videoplayer.PlayerOverlayButton";
+    private static final String VIDEO_INFORMATION =
+            "app.morphe.extension.youtube.patches.VideoInformation";
 
     private static final String PREFS_NAME = "tkprotect";
     private static final String KEY_API_KEY = "api_key";
@@ -83,12 +85,42 @@ public final class TkProtect {
 
     private static Method addButtonMethod;
     private static WebView activeWeb;
+    private static volatile String currentVideoId = "";
 
     private TkProtect() {
     }
 
     /** Injection point: called from AddOnManager.registerAddOns(). */
     public static void register() {
+        registerVideoIdListener();
+        registerOverlayButtonListener();
+    }
+
+    /**
+     * Subscribes to the current video id published by Morphe's videoIdPatch.
+     * This is what makes TKProtect work for a normal viewer: the video being watched is detected
+     * automatically, so nobody has to copy an 11-character id by hand.
+     */
+    private static void registerVideoIdListener() {
+        try {
+            Class.forName(ADD_ON_API)
+                    .getMethod("addVideoIdListener", Consumer.class)
+                    .invoke(null, new Consumer<String>() {
+                        @Override
+                        public void accept(String videoId) {
+                            String id = videoId == null ? "" : videoId;
+                            if (!id.equals(currentVideoId)) {
+                                currentVideoId = id;
+                                notifyVideoChanged(id);
+                            }
+                        }
+                    });
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            Log.w(TAG, "Could not register video id listener", ex);
+        }
+    }
+
+    private static void registerOverlayButtonListener() {
         try {
             Class.forName(ADD_ON_API)
                     .getMethod("addPlayerOverlayButtonsListener", Consumer.class)
@@ -101,6 +133,62 @@ public final class TkProtect {
         } catch (ReflectiveOperationException | RuntimeException ex) {
             Log.w(TAG, "Could not register TKProtect overlay button listener", ex);
         }
+    }
+
+    private static void notifyVideoChanged(final String videoId) {
+        final WebView web = activeWeb;
+        if (web == null) {
+            return;
+        }
+        MAIN.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    JSONObject payload = new JSONObject();
+                    payload.put("video", videoId);
+                    callJs(web, "tkpOnVideo", payload);
+                } catch (Exception ignored) {
+                    // ignored
+                }
+            }
+        });
+    }
+
+    /**
+     * Returns the id of the video currently open in the player.
+     * The listener is the primary source; VideoInformation is a fallback for the case where the
+     * panel is opened before the first id event arrives.
+     */
+    private static String queryVideoId() {
+        String id = currentVideoId;
+        if (!isValidVideoId(id)) {
+            id = "";
+        }
+        if (!id.isEmpty()) {
+            return id;
+        }
+        try {
+            Class<?> info = Class.forName(VIDEO_INFORMATION);
+            String[] names = {"getStartingOrPlayingVideoId", "getVideoId"};
+            for (String name : names) {
+                try {
+                    Object value = info.getMethod(name).invoke(null);
+                    if (value instanceof String && isValidVideoId((String) value)) {
+                        currentVideoId = (String) value;
+                        return currentVideoId;
+                    }
+                } catch (ReflectiveOperationException ignored) {
+                    // try the next getter
+                }
+            }
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            Log.w(TAG, "Could not query current video id", ex);
+        }
+        return "";
+    }
+
+    private static boolean isValidVideoId(String value) {
+        return value != null && value.matches("[A-Za-z0-9_-]{11}");
     }
 
     private static void onPlayerOverlayButtons(View sourceButton) {
@@ -196,7 +284,11 @@ public final class TkProtect {
                     field(activity, box, "Версия клиента YouTube", pref(activity, KEY_CLIENT_VERSION, DEF_CLIENT_VERSION));
 
             TextView hint = new TextView(activity);
-            hint.setText("Без TKCore API key проверка не работает. Ключ хранится только на этом устройстве.");
+            String savedKey = pref(activity, KEY_API_KEY, "");
+            hint.setText(savedKey.isEmpty()
+                    ? "Ключ из web/config.php НЕ используется патчем. Вставьте ваш TKCore API key сюда."
+                    : "Сохранённый ключ: " + maskKey(savedKey)
+                            + " (ключ из web/config.php не используется).");
             hint.setPadding(0, dp(activity, 8), 0, 0);
             box.addView(hint);
             scroll.addView(box);
@@ -250,10 +342,26 @@ public final class TkProtect {
                 @Override
                 public JSONObject execute(JSONObject args) throws Exception {
                     JSONObject out = new JSONObject();
-                    out.put("ready", !pref(context, KEY_API_KEY, "").isEmpty());
+                    String key = pref(context, KEY_API_KEY, "");
+                    out.put("ready", !key.isEmpty());
+                    out.put("keyMask", maskKey(key));
                     return out;
                 }
             });
+        }
+
+        /** Returns the video that is currently playing, so the panel can bind automatically. */
+        @JavascriptInterface
+        public String getVideoId() {
+            return queryVideoId();
+        }
+
+        /** Lets the user override the detected id from the panel. */
+        @JavascriptInterface
+        public void setVideoId(String id) {
+            if (isValidVideoId(id)) {
+                currentVideoId = id;
+            }
         }
 
         @JavascriptInterface
@@ -383,14 +491,8 @@ public final class TkProtect {
         }
 
         private void call(String name, JSONObject payload) {
-            try {
-                if (activeWeb == web) {
-                    web.evaluateJavascript(
-                            "if(window." + name + ")" + name + "(" + JSONObject.quote(payload.toString()) + ");",
-                            null);
-                }
-            } catch (RuntimeException ex) {
-                Log.w(TAG, "Could not deliver JS callback", ex);
+            if (activeWeb == web) {
+                callJs(web, name, payload);
             }
         }
     }
@@ -404,6 +506,26 @@ public final class TkProtect {
             return value;
         }
         return Character.toUpperCase(value.charAt(0)) + value.substring(1);
+    }
+
+    private static String maskKey(String key) {
+        if (key == null || key.isEmpty()) {
+            return "";
+        }
+        if (key.length() <= 4) {
+            return "****";
+        }
+        return "****" + key.substring(key.length() - 4);
+    }
+
+    private static void callJs(WebView web, String name, JSONObject payload) {
+        try {
+            web.evaluateJavascript(
+                    "if(window." + name + ")" + name + "(" + JSONObject.quote(payload.toString()) + ");",
+                    null);
+        } catch (RuntimeException ex) {
+            Log.w(TAG, "Could not deliver JS callback", ex);
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -891,12 +1013,14 @@ public final class TkProtect {
     }
 
     private static String pref(Context context, String key, String fallback) {
-        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .getString(key, fallback);
     }
 
     private static void savePref(Context context, String key, String value) {
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        context.getApplicationContext()
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
                 .putString(key, value)
                 .apply();
@@ -949,8 +1073,8 @@ public final class TkProtect {
                 "</style></head><body>",
                 "<h1>TKProtect</h1>",
                 "<div class=muted id=status>Загрузка...</div>",
-                "<div class=row><input id=video maxlength=11 placeholder='ID видео (11 символов)'>",
-                "<button id=connect>Подключиться</button></div>",
+                "<div class=row><input id=video maxlength=11 placeholder='ID видео (из плеера автоматически)'>",
+                "<button id=connect>Обновить</button></div>",
                 "<div class=tabs><button data-tab=chat class=on>Чат</button>",
                 "<button data-tab=comments>Комментарии</button>",
                 "<button data-tab=tool>TKProtect</button></div>",
@@ -981,21 +1105,27 @@ public final class TkProtect {
                 "$('nHidden').textContent=chat.filter(x=>x.hidden).length+comments.filter(x=>x.hidden).length}",
                 "function merge(old,next){const seen=new Set(old.map(x=>x.id).filter(Boolean));",
                 "return old.concat(next.filter(x=>{if(x.id&&seen.has(x.id))return false;if(x.id)seen.add(x.id);return true})).slice(-300)}",
-                "window.tkpOnBootstrap=d=>{ready=!!d.ready;$('status').textContent=ready?",
-                "'TKProtect активен · ключ задан':'Нет TKCore API key — долгий тап по TK для настроек';",
-                "log(ready?'Готово':'Нет ключа')}",
+                "window.tkpOnBootstrap=d=>{ready=!!d.ready;const k=d.keyMask?(' · ключ '+d.keyMask):'';",
+                "$('status').textContent=ready?('TKProtect активен'+k):'Нет TKCore API key — долгий тап по TK для настроек';",
+                "log(ready?('Готово'+k):'Нет ключа')}",
                 "window.tkpOnCheck=d=>{$('checkResult').className=d.bad?'bad':'muted';",
                 "$('checkResult').textContent=(d.label||d.type||'')+(d.error?' — '+d.error:'')}",
-                "window.tkpOnChat=d=>{if(d.error)log('Чат: '+d.error);chat=resetChat?d.messages:merge(chat,d.messages);",
+                "window.tkpOnVideo=d=>{const v=d.video||'';if(!/^[A-Za-z0-9_-]{11}$/.test(v))return;",
+                "if(v!==videoId){$('video').value=v;connect(v);log('Видео из плеера: '+v)}}",
+                "window.tkpOnChat=d=>{if(d.error==='no_active_live_chat'&&tab==='chat'){switchTab('comments');",
+                "log('У видео нет живого чата — открыты комментарии')}",
+                "if(d.error)log('Чат: '+d.error);chat=resetChat?d.messages:merge(chat,d.messages);",
                 "resetChat=false;refresh()}",
                 "window.tkpOnComments=d=>{if(d.error)log('Комментарии: '+d.error);comments=resetComments?d.comments:merge(comments,d.comments);",
                 "resetComments=false;refresh()}",
-                "$('connect').onclick=()=>{const v=$('video').value.trim();if(!/^[A-Za-z0-9_-]{11}$/.test(v)){alert('Нужен ID из 11 символов');return}",
-                "videoId=v;chat=[];comments=[];resetChat=true;resetComments=true;refresh();log('Подключено к '+v);poll(true)}",
+                "$('connect').onclick=()=>connect($('video').value.trim());",
+                "function connect(v){if(!/^[A-Za-z0-9_-]{11}$/.test(v)){alert('Откройте видео или введите ID из 11 символов');return}",
+                "videoId=v;$('video').value=v;chat=[];comments=[];resetChat=true;resetComments=true;",
+                "refresh();log('Подключено к '+v);poll(true)}",
                 "$('video').onkeydown=e=>{if(e.key==='Enter')$('connect').click()}",
-                "document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{",
-                "document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x===b));tab=b.dataset.tab;",
-                "['chat','comments','tool'].forEach(n=>$('view-'+n).hidden=(n!==tab))})",
+                "function switchTab(n){tab=n;document.querySelectorAll('.tabs button').forEach(x=>x.classList.toggle('on',x.dataset.tab===n));",
+                "['chat','comments','tool'].forEach(x=>$('view-'+x).hidden=(x!==n));poll(false)}",
+                "document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab))",
                 "$('checkBtn').onclick=()=>{const t=$('check').value.trim();if(!t)return;",
                 "$('checkResult').textContent='Проверка...';TK.check(t)}",
                 "$('force').onchange=refresh;",
@@ -1003,6 +1133,9 @@ public final class TkProtect {
                 "else if(tab==='comments')TK.comments(videoId,!!reset)}",
                 "setInterval(()=>{if(videoId&&!document.hidden)poll(false)},5000);",
                 "TK.bootstrap();",
+                "const autoId=TK.getVideoId()||'';",
+                "if(autoId){$('video').value=autoId;connect(autoId);log('ID видео взят из плеера')}",
+                "else log('ID видео не найден — откройте видео или введите ID вручную');",
                 "</script></body></html>"
         );
     }

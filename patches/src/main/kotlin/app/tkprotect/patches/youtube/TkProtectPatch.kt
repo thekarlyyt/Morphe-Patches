@@ -22,8 +22,8 @@ private object AddOnRegisterFingerprint : Fingerprint(
 @Suppress("unused")
 val tkProtectPatch = bytecodePatch(
     name = "TKProtect panel",
-    description = "Adds a TK button to the player overlay that opens the TKProtect web panel " +
-        "with local chat and comment hiding. Long press the button to change the panel URL.",
+    description = "Adds a TK button to the player overlay. It opens a panel bound to the video " +
+        "currently playing, with local chat and comment hiding. Long press to change settings.",
     default = true,
 ) {
     extendWith("extensions/youtube.dex")

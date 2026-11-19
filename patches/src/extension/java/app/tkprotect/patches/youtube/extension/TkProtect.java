@@ -1274,6 +1274,14 @@ public final class TkProtect {
         if (token.isEmpty()) {
             token = continuationOf(pool, "timedContinuationData");
         }
+        if (token.isEmpty()) {
+            token = continuationOf(pool, "reloadContinuationData");
+        }
+        if (token.isEmpty()) {
+            token = continuationOf(node, "invalidationContinuationData");
+            if (token.isEmpty()) token = continuationOf(node, "timedContinuationData");
+            if (token.isEmpty()) token = continuationOf(node, "reloadContinuationData");
+        }
         return token;
     }
 
@@ -1393,21 +1401,61 @@ public final class TkProtect {
         } else if (section != null) {
             pool = section;
         }
-        List<Object> tokens = new ArrayList<>();
-        for (Object value : walk(pool, "continuationItemRenderer")) {
+        String token = findContinuationToken(pool);
+        if (token.isEmpty()) {
+            token = findContinuationToken(node);
+        }
+        return token;
+    }
+
+    private static String findContinuationToken(Object node) {
+        String last = "";
+        // continuationItemRenderer -> continuationEndpoint -> continuationCommand/reloadContinuationData
+        for (Object value : walk(node, "continuationItemRenderer")) {
+            if (!(value instanceof JSONObject)) {
+                continue;
+            }
+            Object endpoint = ((JSONObject) value).opt("continuationEndpoint");
+            String token = tokenFromEndpoint(endpoint);
+            if (!token.isEmpty()) {
+                last = token;
+            }
+        }
+        if (!last.isEmpty()) {
+            return last;
+        }
+        // Fallback: any continuationCommand token (e.g. in other renderer shapes)
+        for (Object value : walk(node, "continuationCommand")) {
             if (value instanceof JSONObject) {
-                Object endpoint = ((JSONObject) value).opt("continuationEndpoint");
-                Object command = endpoint instanceof JSONObject
-                        ? ((JSONObject) endpoint).opt("continuationCommand") : null;
-                if (command instanceof JSONObject) {
-                    String token = ((JSONObject) command).optString("token", "");
-                    if (!token.isEmpty()) {
-                        tokens.add(token);
-                    }
+                String token = ((JSONObject) value).optString("token", "");
+                if (!token.isEmpty()) {
+                    last = token;
                 }
             }
         }
-        return tokens.isEmpty() ? "" : String.valueOf(tokens.get(tokens.size() - 1));
+        return last;
+    }
+
+    private static String tokenFromEndpoint(Object endpoint) {
+        if (!(endpoint instanceof JSONObject)) {
+            return "";
+        }
+        JSONObject ep = (JSONObject) endpoint;
+        Object command = ep.opt("continuationCommand");
+        if (command instanceof JSONObject) {
+            String token = ((JSONObject) command).optString("token", "");
+            if (!token.isEmpty()) {
+                return token;
+            }
+        }
+        Object reload = ep.opt("reloadContinuationData");
+        if (reload instanceof JSONObject) {
+            String token = ((JSONObject) reload).optString("continuation", "");
+            if (!token.isEmpty()) {
+                return token;
+            }
+        }
+        return "";
     }
 
     private static JSONObject commentsPage(Context context, String videoId, String continuation)
@@ -1416,9 +1464,11 @@ public final class TkProtect {
                 ? new JSONObject().put("videoId", videoId)
                 : new JSONObject().put("continuation", continuation);
         JSONObject response = innertube(context, "next", extra);
+        String next = commentsContinuation(response);
         JSONObject out = new JSONObject();
         out.put("comments", extractComments(response));
-        out.put("continuation", commentsContinuation(response));
+        out.put("continuation", next);
+        out.put("hasContinuation", !next.isEmpty());
         out.put("error", "");
         return out;
     }
@@ -2061,7 +2111,8 @@ public final class TkProtect {
                 "log('У видео нет живого чата — открыты комментарии')}",
                 "if(d.error)log('Чат: '+d.error);const msgs=d&&Array.isArray(d.messages)?d.messages:[];",
                 "chat=resetChat?msgs:merge(chat,msgs);resetChat=false;refresh()}",
-                "window.tkpOnComments=d=>{applyStatus(d);if(d.error)log('Комментарии: '+d.error);const cmts=d&&Array.isArray(d.comments)?d.comments:[];",
+                "window.tkpOnComments=d=>{applyStatus(d);const cmts=d&&Array.isArray(d.comments)?d.comments:[];",
+                "if(resetComments||d.error)log('Комментарии: '+cmts.length+(d.hasContinuation?' (ещё...)':'')+(d.error?' · '+d.error:''));",
                 "comments=resetComments?cmts:merge(comments,cmts);resetComments=false;refresh()}",
                 "$('connect').onclick=()=>connect($('video').value.trim());",
                 "function connect(v){if(!/^[A-Za-z0-9_-]{11}$/.test(v)){alert('Откройте видео или введите ID из 11 символов');return}",

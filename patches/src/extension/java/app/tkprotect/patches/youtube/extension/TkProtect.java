@@ -16,6 +16,7 @@ import android.webkit.WebView;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -28,7 +29,10 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
@@ -66,6 +70,23 @@ public final class TkProtect {
             "app.morphe.extension.youtube.videoplayer.PlayerOverlayButton";
     private static final String VIDEO_INFORMATION =
             "app.morphe.extension.youtube.patches.VideoInformation";
+    /**
+     * Morphe's shared Litho filter extension. It holds the runtime path search tree that every
+     * Morphe filter registers its patterns into. TKProtect adds its own pattern to that tree so
+     * flagged comments disappear from YouTube's own comment section, not just from the panel.
+     */
+    private static final String LITHO_FILTER_PATCH =
+            "app.morphe.extension.shared.patches.components.LithoFilterPatch";
+    /**
+     * Path patterns of comment elements. {@code comment_thread.eml} is the element Morphe's
+     * keyword filter parses to read a comment's text; {@code |comment.e} is the per-comment
+     * fragment Morphe's comment filter uses. Their buffers contain the comment text, which is
+     * what we match flagged texts against.
+     */
+    private static final String[] NATIVE_COMMENT_PATH_PATTERNS = {
+            "comment_thread.eml",
+            "|comment.e"
+    };
 
     private static final String PREFS_NAME = "tkprotect";
     private static final String KEY_API_KEY = "api_key";
@@ -87,6 +108,7 @@ public final class TkProtect {
     private static final String KEY_STREAMER_BAN_SECONDS = "streamer_ban_seconds";
     private static final String KEY_STREAMER_MANUAL_BIND = "streamer_manual_bind"; // 0 | 1
     private static final String KEY_STREAMER_MANUAL_LIVE_CHAT_ID = "streamer_manual_live_chat_id";
+    private static final String KEY_NATIVE_HIDE = "native_hide"; // 0 | 1
 
     private static final String DEF_TK_BASE =
             "https://thekarly.su/wp-content/plugins/tkcore/easyapi.php";
@@ -122,6 +144,22 @@ public final class TkProtect {
     private static final long FAILED_TTL_MS = 30_000L;
     private static final int MAX_VERDICTS = 2000;
 
+    /**
+     * Texts that TKCore marked as violations. The Litho callback compares these against the
+     * UTF-8 bytes of every comment element to hide it in YouTube's own comment section.
+     * Kept in insertion order so the oldest entries are evicted first.
+     */
+    private static final Object FLAGGED_LOCK = new Object();
+    private static final LinkedHashMap<String, Boolean> FLAGGED_TEXTS = new LinkedHashMap<>();
+    private static volatile String[] flaggedSnapshot = new String[0];
+    private static final int MAX_FLAGGED_TEXTS = 1000;
+    /** Shorter texts are too likely to match an unrelated comment by chance. */
+    private static final int MIN_NATIVE_HIDE_LENGTH = 6;
+
+    private static volatile boolean nativeHideEnabled = true;
+    private static volatile boolean nativeFilterInstalled;
+    private static volatile Field lithoBufferField;
+
     private static Method addButtonMethod;
     private static WebView activeWeb;
     private static volatile String currentVideoId = "";
@@ -135,6 +173,7 @@ public final class TkProtect {
     public static void register() {
         registerVideoIdListener();
         registerOverlayButtonListener();
+        installNativeCommentFilter();
     }
 
     /**
@@ -152,6 +191,7 @@ public final class TkProtect {
                             String id = videoId == null ? "" : videoId;
                             if (!id.equals(currentVideoId)) {
                                 currentVideoId = id;
+                                clearFlaggedTexts();
                                 notifyVideoChanged(id);
                             }
                         }
@@ -173,6 +213,215 @@ public final class TkProtect {
                     });
         } catch (ReflectiveOperationException | RuntimeException ex) {
             Log.w(TAG, "Could not register TKProtect overlay button listener", ex);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Native comment hiding (Morphe Litho filter)
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * Hides flagged comments in YouTube's own comment section by registering a pattern and
+     * callback into Morphe's Litho path search tree. Everything is done by reflection because
+     * the Morphe classes only exist in the patched app, not when this file is compiled.
+     *
+     * <p>If the class is missing (the user did not apply a patch that includes the Litho filter)
+     * or anything else fails, this logs and returns: TKProtect keeps working with panel-only
+     * hiding, and the app never crashes.
+     */
+    private static void installNativeCommentFilter() {
+        if (nativeFilterInstalled) {
+            return;
+        }
+        try {
+            Class<?> patchClass = Class.forName(LITHO_FILTER_PATCH);
+
+            Field treeField = null;
+            try {
+                treeField = patchClass.getDeclaredField("pathSearchTree");
+            } catch (NoSuchFieldException ignored) {
+                // Fall back to any static trie search whose name mentions the path.
+                for (Field candidate : patchClass.getDeclaredFields()) {
+                    if (candidate.getType().getName().endsWith("StringTrieSearch")
+                            && candidate.getName().toLowerCase(Locale.ROOT).contains("path")) {
+                        treeField = candidate;
+                        break;
+                    }
+                }
+            }
+            if (treeField == null) {
+                Log.w(TAG, "Native comment filter: path search tree not found");
+                return;
+            }
+            treeField.setAccessible(true);
+            final Object tree = treeField.get(null);
+            if (tree == null) {
+                Log.w(TAG, "Native comment filter: path search tree is null");
+                return;
+            }
+
+            // The callback interface is a nested generic interface, so take it from the
+            // addPattern method instead of naming it (keeps working across obfuscation-free
+            // renames of the outer class).
+            Method addPattern = null;
+            Class<?> callbackInterface = null;
+            for (Method method : tree.getClass().getMethods()) {
+                if ("addPattern".equals(method.getName()) && method.getParameterCount() == 2) {
+                    Class<?> candidate = method.getParameterTypes()[1];
+                    if (candidate.isInterface()) {
+                        addPattern = method;
+                        callbackInterface = candidate;
+                        break;
+                    }
+                }
+            }
+            if (addPattern == null || callbackInterface == null) {
+                Log.w(TAG, "Native comment filter: addPattern not found");
+                return;
+            }
+
+            Object callback = Proxy.newProxyInstance(
+                    callbackInterface.getClassLoader(),
+                    new Class<?>[]{callbackInterface},
+                    new InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, Method method, Object[] args) {
+                            if (method.getDeclaringClass() == Object.class) {
+                                switch (method.getName()) {
+                                    case "hashCode":
+                                        return System.identityHashCode(proxy);
+                                    case "equals":
+                                        return proxy == (args == null || args.length == 0 ? null : args[0]);
+                                    case "toString":
+                                        return "TkProtectLithoCallback";
+                                    default:
+                                        return null;
+                                }
+                            }
+                            if ("patternMatched".equals(method.getName())
+                                    && args != null && args.length >= 4) {
+                                try {
+                                    return shouldHideLithoElement(args[3]);
+                                } catch (Throwable ex) {
+                                    // Never break the layout thread: fail open.
+                                    return Boolean.FALSE;
+                                }
+                            }
+                            return Boolean.FALSE;
+                        }
+                    });
+
+            for (String pattern : NATIVE_COMMENT_PATH_PATTERNS) {
+                addPattern.invoke(tree, pattern, callback);
+            }
+            nativeFilterInstalled = true;
+            Log.i(TAG, "Native comment filter installed");
+        } catch (Throwable ex) {
+            Log.w(TAG, "Could not install native comment filter (panel-only hiding stays active)", ex);
+        }
+    }
+
+    /**
+     * @return True if the element must be hidden. {@code callbackParameter} is Morphe's
+     *         {@code LithoFilterParameters}, whose {@code buffer} holds the element proto bytes.
+     */
+    private static Boolean shouldHideLithoElement(Object callbackParameter) {
+        if (!nativeHideEnabled || callbackParameter == null) {
+            return Boolean.FALSE;
+        }
+        final String[] flagged = flaggedSnapshot;
+        if (flagged.length == 0) {
+            return Boolean.FALSE;
+        }
+        byte[] buffer = lithoBufferOf(callbackParameter);
+        if (buffer == null || buffer.length == 0) {
+            return Boolean.FALSE;
+        }
+        // The comment text is stored as a UTF-8 length-delimited string inside the proto, so it
+        // appears contiguously and a plain contains() is enough.
+        String ascii = new String(buffer, StandardCharsets.UTF_8);
+        for (String text : flagged) {
+            if (ascii.contains(text)) {
+                return Boolean.TRUE;
+            }
+        }
+        return Boolean.FALSE;
+    }
+
+    private static byte[] lithoBufferOf(Object callbackParameter) {
+        try {
+            Field field = lithoBufferField;
+            if (field == null) {
+                Class<?> clazz = callbackParameter.getClass();
+                try {
+                    field = clazz.getDeclaredField("buffer");
+                } catch (NoSuchFieldException ignored) {
+                    for (Field candidate : clazz.getDeclaredFields()) {
+                        if (candidate.getType() == byte[].class) {
+                            field = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (field == null) {
+                    return null;
+                }
+                field.setAccessible(true);
+                lithoBufferField = field;
+            }
+            Object value = field.get(callbackParameter);
+            return value instanceof byte[] ? (byte[]) value : null;
+        } catch (ReflectiveOperationException | RuntimeException ex) {
+            return null;
+        }
+    }
+
+    /** Remembers a violating text so the Litho callback can hide the matching comment. */
+    private static void rememberFlaggedText(String text) {
+        if (text == null) {
+            return;
+        }
+        String value = text.trim();
+        if (value.length() < MIN_NATIVE_HIDE_LENGTH) {
+            return;
+        }
+        synchronized (FLAGGED_LOCK) {
+            if (FLAGGED_TEXTS.containsKey(value)) {
+                return;
+            }
+            FLAGGED_TEXTS.put(value, Boolean.TRUE);
+            while (FLAGGED_TEXTS.size() > MAX_FLAGGED_TEXTS) {
+                Iterator<String> it = FLAGGED_TEXTS.keySet().iterator();
+                if (!it.hasNext()) {
+                    break;
+                }
+                it.next();
+                it.remove();
+            }
+            flaggedSnapshot = FLAGGED_TEXTS.keySet().toArray(new String[0]);
+        }
+    }
+
+    /** Drops the flagged texts when the video changes, so they never leak into another video. */
+    private static void clearFlaggedTexts() {
+        synchronized (FLAGGED_LOCK) {
+            if (FLAGGED_TEXTS.isEmpty()) {
+                return;
+            }
+            FLAGGED_TEXTS.clear();
+            flaggedSnapshot = new String[0];
+        }
+    }
+
+    private static void reloadNativeHidePref(Context context) {
+        Context ctx = context != null ? context : appContext;
+        if (ctx == null) {
+            return;
+        }
+        try {
+            nativeHideEnabled = !"0".equals(pref(ctx, KEY_NATIVE_HIDE, "1"));
+        } catch (RuntimeException ex) {
+            nativeHideEnabled = true;
         }
     }
 
@@ -237,6 +486,7 @@ public final class TkProtect {
             Context buttonContext = sourceButton.getContext();
             if (buttonContext != null && buttonContext.getApplicationContext() != null) {
                 appContext = buttonContext.getApplicationContext();
+                reloadNativeHidePref(appContext);
             }
             if (addButtonMethod == null) {
                 addButtonMethod = Class.forName(PLAYER_OVERLAY_BUTTON).getMethod(
@@ -334,6 +584,12 @@ public final class TkProtect {
             final EditText keyInput = field(activity, box, "TKCore API key", pref(activity, KEY_API_KEY, ""));
             final EditText modeInput = field(activity, box, "Режим (phrase2)", pref(activity, KEY_MODE, DEF_MODE));
             final Spinner versionInput = versionField(activity, box, pref(activity, KEY_VERSION, DEF_VERSION));
+
+            final CheckBox nativeHideInput = new CheckBox(activity);
+            nativeHideInput.setText("Скрывать помеченные комментарии в самом YouTube");
+            nativeHideInput.setChecked(!"0".equals(pref(activity, KEY_NATIVE_HIDE, "1")));
+            nativeHideInput.setPadding(0, dp(activity, 10), 0, 0);
+            box.addView(nativeHideInput);
 
             TextView hint = new TextView(activity);
             String savedKey = pref(activity, KEY_API_KEY, "");
@@ -540,6 +796,8 @@ public final class TkProtect {
                         savePref(activity, KEY_API_KEY, keyInput.getText().toString().trim());
                         savePref(activity, KEY_MODE, modeInput.getText().toString().trim());
                         savePref(activity, KEY_VERSION, selectedVersion(versionInput));
+                        savePref(activity, KEY_NATIVE_HIDE, nativeHideInput.isChecked() ? "1" : "0");
+                        reloadNativeHidePref(activity);
                         savePref(activity, KEY_GOOGLE_CLIENT_ID, googleClientIdInput.getText().toString().trim());
                         savePref(activity, KEY_GOOGLE_CLIENT_SECRET, googleClientSecretInput.getText().toString().trim());
                         savePref(activity, KEY_STREAMER_ACTION, streamerActionInput.getSelectedItemPosition() == 1 ? "manual" : "auto_delete");
@@ -1042,6 +1300,9 @@ public final class TkProtect {
             key = md5(text);
             Verdict cached = VERDICTS.get(key);
             if (cached != null) {
+                if (cached.bad) {
+                    rememberFlaggedText(text);
+                }
                 return cached;
             }
             // Network/parse failures are fail-open (not hidden). Remember them briefly so the
@@ -1067,6 +1328,9 @@ public final class TkProtect {
                     FAILED_UNTIL.clear();
                 }
             }
+        }
+        if (verdict != null && verdict.bad) {
+            rememberFlaggedText(text);
         }
         return verdict;
     }

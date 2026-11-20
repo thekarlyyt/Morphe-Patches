@@ -40,7 +40,6 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.HashSet;
@@ -48,8 +47,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 /**
@@ -134,15 +136,29 @@ public final class TkProtect {
     };
 
     private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2);
+    /** Background comment scan, so detection starts without opening the TK panel. */
+    private static final ScheduledExecutorService SCANNER =
+            Executors.newSingleThreadScheduledExecutor();
+    private static final Runnable AUTO_SCAN = new Runnable() {
+        @Override
+        public void run() {
+            autoScanTick();
+        }
+    };
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
-    private static final Map<String, String> CHAT_CONTINUATIONS = new HashMap<>();
-    private static final Map<String, String> COMMENT_CONTINUATIONS = new HashMap<>();
-    private static final Map<String, CommentsState> COMMENT_STATES = new HashMap<>();
+    private static final Map<String, String> CHAT_CONTINUATIONS = new ConcurrentHashMap<>();
+    private static final Map<String, String> COMMENT_CONTINUATIONS = new ConcurrentHashMap<>();
+    private static final Map<String, CommentsState> COMMENT_STATES = new ConcurrentHashMap<>();
     private static final Map<String, Verdict> VERDICTS = new LinkedHashMap<>();
-    private static final Map<String, Long> FAILED_UNTIL = new HashMap<>();
+    private static final Object VERDICT_LOCK = new Object();
+    private static final Map<String, Long> FAILED_UNTIL = new ConcurrentHashMap<>();
     private static final Map<String, Boolean> DELETED_MESSAGES = new LinkedHashMap<>();
     private static final long FAILED_TTL_MS = 30_000L;
     private static final int MAX_VERDICTS = 2000;
+    /** How often the background scanner re-reads comments while a video is open. */
+    private static final int AUTO_SCAN_INTERVAL_SECONDS = 20;
+    /** Checking more than this many comments per scan keeps the background traffic low. */
+    private static final int AUTO_SCAN_MAX_COMMENTS = 30;
 
     /**
      * Texts that TKCore marked as violations. The Litho callback compares these against the
@@ -174,6 +190,7 @@ public final class TkProtect {
         registerVideoIdListener();
         registerOverlayButtonListener();
         installNativeCommentFilter();
+        startAutoScanner();
     }
 
     /**
@@ -192,6 +209,7 @@ public final class TkProtect {
                             if (!id.equals(currentVideoId)) {
                                 currentVideoId = id;
                                 clearFlaggedTexts();
+                                requestAutoScan();
                                 notifyVideoChanged(id);
                             }
                         }
@@ -425,6 +443,79 @@ public final class TkProtect {
         }
     }
 
+    // ---------------------------------------------------------------------------------------
+    // Automatic comment detection
+    // ---------------------------------------------------------------------------------------
+
+    private static void startAutoScanner() {
+        try {
+            SCANNER.scheduleWithFixedDelay(
+                    AUTO_SCAN, 5, AUTO_SCAN_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        } catch (RuntimeException ex) {
+            Log.w(TAG, "Could not start automatic comment scan", ex);
+        }
+    }
+
+    /** Scans immediately when a new video is detected, if the app context is already available. */
+    private static void requestAutoScan() {
+        if (appContext == null) {
+            return;
+        }
+        try {
+            SCANNER.execute(AUTO_SCAN);
+        } catch (RuntimeException ex) {
+            // The periodic scan will pick it up instead.
+        }
+    }
+
+    /**
+     * Reads the current video's comments in the background and checks them through TKCore.
+     * Opening the TK panel is no longer required for detection or native comment hiding.
+     */
+    private static void autoScanTick() {
+        Context ctx = appContext;
+        String videoId = currentVideoId;
+        if (ctx == null || !isValidVideoId(videoId) || !nativeHideEnabled) {
+            return;
+        }
+        try {
+            if (pref(ctx, KEY_API_KEY, "").isEmpty()) {
+                return;
+            }
+            JSONObject page = commentsPage(ctx, videoId, "");
+            JSONArray comments = page.optJSONArray("comments");
+            String next = page.optString("continuation", "");
+            // The first "next" reply often only carries a continuation token.
+            if ((comments == null || comments.length() == 0) && !next.isEmpty()) {
+                JSONObject follow = commentsPage(ctx, videoId, next);
+                JSONArray more = follow.optJSONArray("comments");
+                if (more != null && more.length() > 0) {
+                    comments = more;
+                }
+            }
+            if (comments == null) {
+                return;
+            }
+            int count = Math.min(comments.length(), AUTO_SCAN_MAX_COMMENTS);
+            for (int i = 0; i < count; i++) {
+                // Do not let a scan of the previous video pollute the new one.
+                if (!videoId.equals(currentVideoId)) {
+                    return;
+                }
+                JSONObject item = comments.getJSONObject(i);
+                String text = item.optString("text", "");
+                if (text.isEmpty()) {
+                    continue;
+                }
+                // verdictForText records bad texts for the native Litho filter.
+                verdictForText(ctx, text);
+            }
+        } catch (Throwable ex) {
+            // A single failed scan must never stop the scheduled executor.
+            Log.w(TAG, "Automatic comment scan failed", ex);
+        }
+    }
+
     private static void notifyVideoChanged(final String videoId) {
         final WebView web = activeWeb;
         if (web == null) {
@@ -487,6 +578,7 @@ public final class TkProtect {
             if (buttonContext != null && buttonContext.getApplicationContext() != null) {
                 appContext = buttonContext.getApplicationContext();
                 reloadNativeHidePref(appContext);
+                requestAutoScan();
             }
             if (addButtonMethod == null) {
                 addButtonMethod = Class.forName(PLAYER_OVERLAY_BUTTON).getMethod(
@@ -1298,34 +1390,42 @@ public final class TkProtect {
         String key = null;
         try {
             key = md5(text);
-            Verdict cached = VERDICTS.get(key);
-            if (cached != null) {
-                if (cached.bad) {
-                    rememberFlaggedText(text);
-                }
-                return cached;
-            }
-            // Network/parse failures are fail-open (not hidden). Remember them briefly so the
-            // same message is not re-checked on every 5s poll while the request is unstable.
-            Long until = FAILED_UNTIL.get(key);
-            if (until != null) {
-                if (until > System.currentTimeMillis()) {
-                    return new Verdict("error", "Ошибка проверки (ожидание повтора)", false);
-                }
-                FAILED_UNTIL.remove(key);
-            }
         } catch (Exception ignored) {
             // ignored
         }
+        if (key != null) {
+            synchronized (VERDICT_LOCK) {
+                Verdict cached = VERDICTS.get(key);
+                if (cached != null) {
+                    if (cached.bad) {
+                        rememberFlaggedText(text);
+                    }
+                    return cached;
+                }
+                // Network/parse failures are fail-open (not hidden). Remember them briefly so the
+                // same text is not re-checked on every scan while the request is unstable.
+                Long until = FAILED_UNTIL.get(key);
+                if (until != null) {
+                    if (until > System.currentTimeMillis()) {
+                        return new Verdict("error", "Ошибка проверки (ожидание повтора)", false);
+                    }
+                    FAILED_UNTIL.remove(key);
+                }
+            }
+        }
+        // The network call happens outside the lock; the panel and the background scanner may
+        // check different texts at the same time.
         Verdict verdict = checkText(context, text);
         if (key != null && verdict != null) {
-            if (!"error".equals(verdict.type)) {
-                rememberVerdict(key, verdict);
-                FAILED_UNTIL.remove(key);
-            } else {
-                FAILED_UNTIL.put(key, System.currentTimeMillis() + FAILED_TTL_MS);
-                if (FAILED_UNTIL.size() > 400) {
-                    FAILED_UNTIL.clear();
+            synchronized (VERDICT_LOCK) {
+                if (!"error".equals(verdict.type)) {
+                    rememberVerdict(key, verdict);
+                    FAILED_UNTIL.remove(key);
+                } else {
+                    FAILED_UNTIL.put(key, System.currentTimeMillis() + FAILED_TTL_MS);
+                    if (FAILED_UNTIL.size() > 400) {
+                        FAILED_UNTIL.clear();
+                    }
                 }
             }
         }
